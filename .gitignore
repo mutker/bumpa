@@ -1,0 +1,10 @@
+/.bumpa.yaml
+/.pre-commit-config.yaml
+/.zed/
+/.devenv/
+/.direnv/
+/.idea/
+/bin/
+/build/
+/var/
+/vendor/

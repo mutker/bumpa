@@ -1,0 +1,109 @@
+logging:
+  environment: development
+  timeformat: "RFC3339"
+  output: console
+  level: debug
+
+# logging:
+#   environment: production
+#   timeformat: "TimeFormatUnix"
+#   output: file
+#   path: "/var/log/bumpa/bumpa.log"
+#   level: info
+
+llm:
+  provider: ollama
+  model: llama3.1:8b-instruct-q8_0
+  base_url: "http://localhost:11434"
+  api_key: "" # Ollama typically doesn't require an API key
+
+# llm:
+#   provider: openai
+#   model: llama-3.1-70b-versatile
+#   base_url: https://api.groq.com/openai/v1
+#   api_key: gsk_xxx
+
+git:
+  include_gitignore: true
+  ignore:
+    - "go.mod"
+    - "go.sum"
+    - "*.log"
+    - "tmp/"
+    - "vendor/"
+
+templates:
+  commit_message: |
+    {{.Type}}{% if .Scope %}({{.Scope}}){% endif %}: {{.Description}}
+
+    {% if .Body %}{{.Body}}{% endif %}
+
+    {% if .Footer %}{{.Footer}}{% endif %}
+
+prompts:
+  diff_summary:
+    system: |
+      You are an AI assistant that summarize changes into a single Conventional Commit formatted message. Focus on the key modifications, additions, or deletions, and ignore minor changes such as added, removed, or sorted imports. Never try to recommend any fixes or modifications to the code, and only summarize the changes regardless of their quality. Limit the summary to 1-2 sentences.
+
+    user: |
+      IMPORTANT: Generate a SINGLE commit message that summarizes ALL changes. Do not create separate summaries for different files.
+      {{.Diff}}
+
+  file_summary:
+    system: You are an AI assistant that summarize the changes to a file in one short sentence.
+    user: |
+      IMPORTANT: Focus on the key modifications, additions, or deletions, and ignore any changes such as added, removed, or sorted imports. NEVER provide improvements or ways to fix the code, only respond with a summary of the changes regardless of quality.
+
+      File: %s\nStatus: %s\nSummarize the changes:
+
+  commit_message:
+    system: |
+      You are an AI assistant that generates Git commit messages strictly adhering to the Conventional Commits format. Your task is to create a single, concise, and meaningful commit message that summarizes all changes across multiple files.
+
+      The format MUST be:
+      <type>[optional scope]: <description>
+
+      [optional body]
+
+      [optional footer]
+
+      Strict rules:
+      1. <type> MUST be one of: feat, fix, docs, style, refactor, perf, test, chore, ci, build, revert
+      2. Generate ONLY ONE commit message summarizing ALL changes across all files.
+      3. The first line (header) is MANDATORY and MUST follow this exact format:
+        - Start with <type>
+        - Optionally followed by (scope) in parentheses
+        - Followed by a colon and a space
+        - Followed by a brief description in imperative, present tense, lowercase, without a period at the end
+      4. The header MUST NOT be longer than 100 characters.
+      5. A blank line MAY follow the header.
+      6. The body is OPTIONAL. If included:
+        - Must be preceded by a blank line
+        - May consist of any number of paragraphs or bullet points
+        - Each line MUST be 100 characters or less
+      7. A footer MAY be provided after the body, separated by a blank line.
+      8. Do NOT include file names in the header unless absolutely necessary.
+      9. Prioritize describing the overall change rather than listing individual file changes.
+
+      Examples of valid commit messages:
+      feat: add user authentication feature
+      fix(database): resolve connection timeout issue
+      docs: update README with new API endpoints
+      refactor(api): simplify error handling in user routes
+
+      feat: implement new logging system
+
+      - Add timestamp to all log entries
+      - Introduce log levels (INFO, WARN, ERROR)
+      - Create rotating log files
+
+      BREAKING CHANGE: New log format is not compatible with previous parsers
+
+    user: |
+      CRITICAL: Generate a SINGLE commit message that strictly follows the Conventional Commits format as described in the system message. The message MUST start with a type, optionally followed by a scope in parentheses, then a colon, a space, and a brief description. The entire first line MUST NOT exceed 100 characters.
+
+      Here's a summary of the changes:
+
+      %s
+
+      Respond ONLY with the commit message. Do NOT include any explanations, analysis, or additional text outside of the commit message format.
