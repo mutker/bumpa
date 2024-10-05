@@ -1,5 +1,8 @@
 # bumpa
 
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![Go Report Card](https://goreportcard.com/badge/codeberg.org/mutker/bumpa)](https://goreportcard.com/report/codeberg.org/mutker/bumpa)
+
 🚧 **HIGHLY EXPERIMENTAL WORK IN PROGRESS** 🚧
 
 bumpa leverages LLMs to assist in generating changelogs, bumping application versions, creating release notes, and generating commit messages based on conventional commits.
