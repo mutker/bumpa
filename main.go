@@ -3,9 +3,11 @@ package main
 import (
 	"bufio"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"sort"
@@ -15,6 +17,8 @@ import (
 	"github.com/firebase/genkit/go/ai"
 	"github.com/firebase/genkit/go/plugins/ollama"
 	"github.com/go-git/go-git/v5"
+	"github.com/go-git/go-git/v5/plumbing"
+	"github.com/go-git/go-git/v5/plumbing/format/gitignore"
 	"github.com/go-git/go-git/v5/plumbing/object"
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
@@ -44,44 +48,20 @@ type Config struct {
 	}
 
 	LLM struct {
-		Provider string
-		Model    string
-		BaseURL  string `mapstructure:"base_url"`
-		APIKey   string `mapstructure:"api_key"`
+		Provider   string
+		Model      string
+		BaseURL    string `mapstructure:"base_url"`
+		APIKey     string `mapstructure:"api_key"`
+		MaxRetries int    `mapstructure:"max_retries"`
 	}
 
-	Prompts struct {
-		DiffSummary struct {
-			System, User string
-		}
-		CommitMessage struct {
-			System, User string
-		}
-		FileSummary struct {
-			System, User string
-		}
-	}
-	Templates struct {
-		CommitMessage string
-	}
-	Commit CommitConfig
+	Tools []Tool `mapstructure:"tools"`
 }
 
-type CommitConfig struct {
-	IncludeGitignore bool
-	Ignore           []string
-	Templates        struct {
-		CommitMessage string
-	}
-	Prompts struct {
-		DiffSummary   PromptPair
-		CommitMessage PromptPair
-		FileSummary   PromptPair
-	}
-}
-
-type PromptPair struct {
-	System, User string
+type Tool struct {
+	Name        string          `json:"name"`
+	Description string          `json:"description"`
+	InputSchema json.RawMessage `json:"input_schema"`
 }
 
 type CommitGenerator struct {
@@ -92,7 +72,7 @@ type CommitGenerator struct {
 }
 
 type LLMClient interface {
-	GenerateText(ctx context.Context, systemPrompt, userPrompt string) (string, error)
+	CallTool(ctx context.Context, toolName string, input interface{}) (string, error)
 }
 
 type OllamaClient struct {
@@ -124,24 +104,23 @@ func main() {
 		log.Fatal().Err(err).Msg("failed to initialize LLM")
 	}
 
-	// Open the existing repository
 	repo, err := git.PlainOpen(".")
 	if err != nil {
 		log.Fatal().Err(err).Msg("failed to open git repository")
 	}
 
-	commitGen := NewCommitGenerator(cfg, llm, log.Logger, repo)
+	cg := NewCommitGenerator(cfg, llm, log.Logger, repo)
 
-	message, err := commitGen.generate()
+	message, err := cg.generate()
 	if err != nil {
-		if err == ErrNoChanges {
+		if err.Error() == "no changes to commit" {
 			log.Info().Msg("no changes to commit")
 			return
 		}
 		log.Fatal().Err(err).Msg("failed to generate commit message")
 	}
 
-	filesToCommit, err := getFilesToCommit(repo)
+	filesToCommit, err := cg.getFilesToCommit()
 	if err != nil {
 		log.Fatal().Err(err).Msg("failed to get files to commit")
 	}
@@ -151,24 +130,21 @@ func main() {
 		return
 	}
 
-	fileList := strings.Builder{}
-	fileList.WriteString("Files:\n")
-	for _, file := range filesToCommit {
-		fileList.WriteString(fmt.Sprintf("  %s\n", file))
-	}
-
-	promptMessage := fmt.Sprintf("%s\nDo you want to commit the following files with the message: %q?", fileList.String(), message)
-
-	if !promptYesNo(promptMessage) {
+	action, editedMessage := promptUserAction(message, filesToCommit)
+	switch action {
+	case "commit":
+		if err := cg.makeCommit(message, filesToCommit); err != nil {
+			log.Fatal().Err(err).Msg("failed to commit")
+		}
+		log.Info().Msg("commit successfully created")
+	case "edit":
+		if err := cg.makeCommit(editedMessage, filesToCommit); err != nil {
+			log.Fatal().Err(err).Msg("failed to commit")
+		}
+		log.Info().Msg("commit successfully created with edited message")
+	case "quit":
 		log.Info().Msg("commit aborted")
-		return
 	}
-
-	if err := makeCommit(repo, message, filesToCommit); err != nil {
-		log.Fatal().Err(err).Msg("failed to commit")
-	}
-
-	log.Info().Msg("commit successfully created")
 }
 
 func loadConfig() (*Config, error) {
@@ -178,7 +154,7 @@ func loadConfig() (*Config, error) {
 	viper.AutomaticEnv()
 
 	viper.SetDefault("llm.provider", "ollama")
-	viper.SetDefault("llm.model", "llama3.1:8b-instruct-q8_0")
+	viper.SetDefault("llm.model", "llama3.2:latest")
 	viper.SetDefault("llm.base_url", "http://localhost:11434")
 	viper.SetDefault("llm.api_key", "")
 	viper.SetDefault("logging.environment", "development")
@@ -246,6 +222,17 @@ func initLogger() error {
 	return nil
 }
 
+func getTimeFormat(formatString string) string {
+	switch formatString {
+	case "RFC3339":
+		return time.RFC3339
+	case "TimeFormatUnix":
+		return "UNIXTIME"
+	default:
+		return time.RFC3339 // Default to RFC3339 if not specified or unknown
+	}
+}
+
 func initLLM(ctx context.Context, cfg *Config) (LLMClient, error) {
 	switch cfg.LLM.Provider {
 	case "ollama":
@@ -290,14 +277,17 @@ func initOpenAIClient(cfg *Config) (*OpenAIClient, error) {
 	}, nil
 }
 
-func (c *OllamaClient) GenerateText(ctx context.Context, systemPrompt, userPrompt string) (string, error) {
-	if c.model == nil {
-		return "", fmt.Errorf("failed to initialize Ollama model")
+func (c *OllamaClient) CallTool(ctx context.Context, toolName string, input interface{}) (string, error) {
+	inputJSON, err := json.Marshal(input)
+	if err != nil {
+		return "", fmt.Errorf("failed to marshal tool input: %w", err)
 	}
+
+	prompt := fmt.Sprintf("Use the %s tool with the following input:\n%s", toolName, string(inputJSON))
 	log.Debug().Msg("Sending request to Ollama")
 	result, err := ai.GenerateText(ctx, c.model,
-		ai.WithSystemPrompt(systemPrompt),
-		ai.WithTextPrompt(userPrompt))
+		ai.WithSystemPrompt(""),
+		ai.WithTextPrompt(prompt))
 	if err != nil {
 		return "", fmt.Errorf("failed request to Ollama: %w", err)
 	}
@@ -305,7 +295,12 @@ func (c *OllamaClient) GenerateText(ctx context.Context, systemPrompt, userPromp
 	return result, nil
 }
 
-func (c *OpenAIClient) GenerateText(ctx context.Context, systemPrompt, userPrompt string) (string, error) {
+func (c *OpenAIClient) CallTool(ctx context.Context, toolName string, input interface{}) (string, error) {
+	inputJSON, err := json.Marshal(input)
+	if err != nil {
+		return "", fmt.Errorf("failed to marshal tool input: %w", err)
+	}
+
 	resp, err := c.client.CreateChatCompletion(
 		ctx,
 		openai.ChatCompletionRequest{
@@ -313,17 +308,17 @@ func (c *OpenAIClient) GenerateText(ctx context.Context, systemPrompt, userPromp
 			Messages: []openai.ChatCompletionMessage{
 				{
 					Role:    openai.ChatMessageRoleSystem,
-					Content: systemPrompt,
+					Content: fmt.Sprintf("You are an AI assistant that uses the %s tool.", toolName),
 				},
 				{
 					Role:    openai.ChatMessageRoleUser,
-					Content: userPrompt,
+					Content: fmt.Sprintf("Use the %s tool with the following input:\n%s", toolName, string(inputJSON)),
 				},
 			},
 		},
 	)
 	if err != nil {
-		return "", fmt.Errorf("failed to generate text: %w", err)
+		return "", fmt.Errorf("failed to call OpenAI API: %w", err)
 	}
 	return resp.Choices[0].Message.Content, nil
 }
@@ -332,8 +327,6 @@ func NewCommitGenerator(cfg *Config, llm LLMClient, logger zerolog.Logger, repo 
 	return &CommitGenerator{cfg: cfg, llm: llm, logger: logger, repo: repo}
 }
 
-var ErrNoChanges = fmt.Errorf("no changes to commit")
-
 func (cg *CommitGenerator) generate() (string, error) {
 	fileSummaries, err := cg.getFileSummaries()
 	if err != nil {
@@ -341,7 +334,7 @@ func (cg *CommitGenerator) generate() (string, error) {
 	}
 
 	if len(fileSummaries) == 0 {
-		return "", ErrNoChanges
+		return "", fmt.Errorf("no changes to commit")
 	}
 
 	diffSummary := cg.generateDiffSummary(fileSummaries)
@@ -349,12 +342,24 @@ func (cg *CommitGenerator) generate() (string, error) {
 
 	commitMessage, err := cg.generateCommitMessageFromSummary(diffSummary)
 	if err != nil {
-		log.Fatal().Err(err).Msg("Failed to generate valid commit message")
-		return "", err // This line is technically unnecessary due to log.Fatal, but included for clarity
+		log.Error().Err(err).Msg("Failed to generate valid commit message")
+		return "", err
 	}
 
-	log.Info().Str("message", commitMessage).Msg("Generated commit message")
+	// Remove trailing period if present
+	commitMessage = strings.TrimSuffix(commitMessage, ".")
+
+	log.Info().Str("message", commitMessage).Msgf("Generated commit message: %s", commitMessage)
 	return commitMessage, nil
+}
+
+func (cg *CommitGenerator) findTool(name string) *Tool {
+	for _, tool := range cg.cfg.Tools {
+		if tool.Name == name {
+			return &tool
+		}
+	}
+	return nil
 }
 
 func (cg *CommitGenerator) shouldIgnoreFile(path string) bool {
@@ -366,13 +371,38 @@ func (cg *CommitGenerator) shouldIgnoreFile(path string) bool {
 		}
 	}
 
-	// FIXME: We're not checking against .gitignore in this in-memory approach
+	// Check against .gitignore if IncludeGitignore is true
+	if cg.cfg.Git.IncludeGitignore {
+		wt, err := cg.repo.Worktree()
+		if err != nil {
+			log.Error().Err(err).Msg("Failed to get worktree")
+			return false
+		}
+
+		patterns, err := gitignore.ReadPatterns(wt.Filesystem, nil)
+		if err != nil {
+			log.Error().Err(err).Msg("Failed to read gitignore patterns")
+			return false
+		}
+
+		matcher := gitignore.NewMatcher(patterns)
+		if matcher.Match([]string{path}, false) {
+			return true
+		}
+	}
+
 	return false
 }
 
 func (cg *CommitGenerator) generateDiffSummary(fileSummaries map[string]string) string {
+	branchName, err := cg.getCurrentBranch()
+	if err != nil {
+		log.Warn().Err(err).Msg("failed to get current branch name")
+		branchName = "unknown"
+	}
+
 	var summaryBuilder strings.Builder
-	summaryBuilder.WriteString("Changes in multiple files:\n\n")
+	summaryBuilder.WriteString(fmt.Sprintf("Changes on branch '%s':\n\n", branchName))
 	for file, summary := range fileSummaries {
 		summaryBuilder.WriteString(fmt.Sprintf("- %s: %s\n", file, summary))
 	}
@@ -392,6 +422,48 @@ func (cg *CommitGenerator) getFileStatus(status *git.FileStatus) string {
 	default:
 		return "Changed"
 	}
+}
+
+func (cg *CommitGenerator) getCurrentBranch() (string, error) {
+	head, err := cg.repo.Head()
+	if err != nil {
+		return "", fmt.Errorf("failed to get HEAD: %w", err)
+	}
+
+	if head.Name().IsBranch() {
+		return head.Name().Short(), nil
+	}
+
+	// If HEAD is detached, try to find the closest branch
+	refs, err := cg.repo.References()
+	if err != nil {
+		return "", fmt.Errorf("failed to get references: %w", err)
+	}
+
+	var closestBranch string
+	var closestCommit *object.Commit
+	err = refs.ForEach(func(ref *plumbing.Reference) error {
+		if ref.Name().IsBranch() {
+			commit, err := cg.repo.CommitObject(ref.Hash())
+			if err != nil {
+				return nil // Skip this reference
+			}
+			if closestCommit == nil || commit.Committer.When.After(closestCommit.Committer.When) {
+				closestBranch = ref.Name().Short()
+				closestCommit = commit
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return "", fmt.Errorf("failed to iterate over references: %w", err)
+	}
+
+	if closestBranch == "" {
+		return "DETACHED_HEAD", nil
+	}
+
+	return closestBranch, nil
 }
 
 func (cg *CommitGenerator) getFileDiff(path string) (string, error) {
@@ -482,10 +554,21 @@ func (cg *CommitGenerator) generateFileSummary(path string, status *git.FileStat
 		return "", fmt.Errorf("failed to get diff for %s: %w", path, err)
 	}
 
-	prompt := cg.cfg.Commit.Prompts.FileSummary
-	fileSummaryPrompt := fmt.Sprintf(prompt.User, path, cg.getFileStatus(status), diff)
+	filteredDiff, hasSignificantChanges := cg.filterImportChanges(diff)
 
-	summary, err := cg.llm.GenerateText(ctx, prompt.System, fileSummaryPrompt)
+	input := map[string]interface{}{
+		"file":                  path,
+		"status":                cg.getFileStatus(status),
+		"diff":                  filteredDiff,
+		"hasSignificantChanges": hasSignificantChanges,
+	}
+
+	tool := cg.findTool("generate_file_summary")
+	if tool == nil {
+		return "", fmt.Errorf("generate_file_summary tool not found in configuration")
+	}
+
+	summary, err := cg.llm.CallTool(ctx, tool.Name, input)
 	if err != nil {
 		return "", fmt.Errorf("failed to generate file summary: %w", err)
 	}
@@ -528,105 +611,53 @@ func (cg *CommitGenerator) generateCommitMessageFromSummary(summary string) (str
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	systemPrompt := cg.cfg.Prompts.CommitMessage.System
-	userPrompt := fmt.Sprintf(cg.cfg.Prompts.CommitMessage.User, summary)
+	branchName, err := cg.getCurrentBranch()
+	if err != nil {
+		log.Warn().Err(err).Msg("Failed to get current branch name")
+		branchName = "unknown"
+	}
 
-	for attempts := 0; attempts < 3; attempts++ {
-		log.Debug().Str("systemPrompt", systemPrompt).Str("userPrompt", userPrompt).Msg("Sending prompts to LLM")
+	input := map[string]interface{}{
+		"summary": summary,
+		"branch":  branchName,
+	}
 
-		message, err := cg.llm.GenerateText(ctx, systemPrompt, userPrompt)
+	tool := cg.findTool("generate_conventional_commit")
+	if tool == nil {
+		return "", fmt.Errorf("generate_conventional_commit tool not found in configuration")
+	}
+
+	maxRetries := cg.cfg.LLM.MaxRetries
+	if maxRetries < 1 {
+		maxRetries = 1 // Ensure at least one attempt is made
+	}
+
+	for retries := 0; retries < maxRetries; retries++ {
+		message, err := cg.llm.CallTool(ctx, tool.Name, input)
 		if err != nil {
 			return "", fmt.Errorf("failed to generate commit message: %w", err)
 		}
 
 		log.Debug().Str("generatedMessage", message).Msg("Received message from LLM")
 
+		// Remove trailing period if present
+		message = strings.TrimSuffix(message, ".")
+
 		if isValidCommitMessage(message) {
 			return message, nil
 		}
 
-		// If invalid, try to extract a valid message
-		extractedMessage := extractConventionalCommit(message)
-		if extractedMessage != "" {
-			return extractedMessage, nil
-		}
-
-		// If extraction fails, update the prompt and try again
-		userPrompt = fmt.Sprintf("The previous response was invalid. Please generate a commit message in the Conventional Commits format. It should start with a type (feat, fix, etc.) followed by a colon and a short description. Here's the summary again:\n\n%s", summary)
-	}
-
-	return "", fmt.Errorf("failed to generate a valid commit message after multiple attempts")
-}
-
-func (cg *CommitGenerator) processCommitMessage(message string) string {
-	message = strings.TrimSpace(message)
-	lines := strings.Split(message, "\n")
-
-	// Extract the first line that matches the Conventional Commit format
-	var header string
-	for _, line := range lines {
-		if isValidCommitMessage(line) {
-			header = line
-			break
+		// If invalid and not the last attempt, update the input and try again
+		if retries < maxRetries-1 {
+			input["summary"] = fmt.Sprintf("The previous response was invalid. Please generate a commit message in the Conventional Commits format. It should start with a type (feat, fix, refactor, etc.) followed by a colon and a short description. Do not end with a period. Consider the branch name '%s'. Here's the summary again:\n\n%s", branchName, summary)
 		}
 	}
 
-	if header == "" {
-		log.Error().Str("invalidMessage", message).Msg("Generated commit message is not in the expected format")
-		return ""
-	}
-
-	if len(header) > 100 {
-		log.Warn().Str("header", header).Msg("Commit message header exceeds 100 characters")
-		header = header[:100]
-	}
-
-	// Construct the body from the remaining lines
-	var body strings.Builder
-	for _, line := range lines[1:] {
-		if len(line) > 100 {
-			line = line[:100]
-		}
-		body.WriteString(line)
-		body.WriteString("\n")
-	}
-
-	if body.Len() > 0 {
-		return fmt.Sprintf("%s\n\n%s", header, strings.TrimSpace(body.String()))
-	}
-
-	return header
+	return "", fmt.Errorf("failed to generate a valid commit message after %d attempts", maxRetries)
 }
 
-func isValidCommitType(message string) bool {
-	validTypes := []string{"feat", "fix", "docs", "style", "refactor", "perf", "test", "chore", "ci", "build", "revert"}
-	for _, validType := range validTypes {
-		if strings.HasPrefix(strings.ToLower(message), validType+":") || strings.HasPrefix(strings.ToLower(message), validType+"(") {
-			return true
-		}
-	}
-	return false
-}
-
-func isValidCommitMessage(message string) bool {
-	// Implement a stricter check for Conventional Commits format
-	pattern := `^(feat|fix|docs|style|refactor|perf|test|chore|ci|build|revert)(\([a-z]+\))?: [a-z].+`
-	matched, _ := regexp.MatchString(pattern, strings.Split(message, "\n")[0])
-	return matched
-}
-
-func extractConventionalCommit(message string) string {
-	lines := strings.Split(message, "\n")
-	for _, line := range lines {
-		if isValidCommitMessage(line) {
-			return line
-		}
-	}
-	return ""
-}
-
-func getFilesToCommit(repo *git.Repository) ([]string, error) {
-	w, err := repo.Worktree()
+func (cg *CommitGenerator) getFilesToCommit() ([]string, error) {
+	w, err := cg.repo.Worktree()
 	if err != nil {
 		return nil, err
 	}
@@ -647,8 +678,8 @@ func getFilesToCommit(repo *git.Repository) ([]string, error) {
 	return files, nil
 }
 
-func makeCommit(repo *git.Repository, message string, filesToAdd []string) error {
-	w, err := repo.Worktree()
+func (cg *CommitGenerator) makeCommit(message string, filesToAdd []string) error {
+	w, err := cg.repo.Worktree()
 	if err != nil {
 		return err
 	}
@@ -660,7 +691,7 @@ func makeCommit(repo *git.Repository, message string, filesToAdd []string) error
 		}
 	}
 
-	cfg, err := repo.Config()
+	cfg, err := cg.repo.Config()
 	if err != nil {
 		return fmt.Errorf("failed to get git config: %w", err)
 	}
@@ -685,30 +716,112 @@ func makeCommit(repo *git.Repository, message string, filesToAdd []string) error
 	return err
 }
 
-func promptYesNo(question string) bool {
-	log.Debug().Str("question", question).Msg("Prompting user for confirmation")
-	fmt.Printf("%s (y/N): ", question)
+func (cg *CommitGenerator) filterImportChanges(diff string) (string, bool) {
+	lines := strings.Split(diff, "\n")
+	var filteredLines []string
+	var nonImportLines []string
+	inImportBlock := false
+	significantImportChanges := false
+	nonImportChanges := 0
+
+	for _, line := range lines {
+		if strings.HasPrefix(line, "import (") {
+			inImportBlock = true
+			filteredLines = append(filteredLines, line)
+			continue
+		}
+		if inImportBlock && strings.HasPrefix(line, ")") {
+			inImportBlock = false
+			filteredLines = append(filteredLines, line)
+			continue
+		}
+		if inImportBlock {
+			if strings.HasPrefix(line, "+") || strings.HasPrefix(line, "-") {
+				significantImportChanges = true
+				filteredLines = append(filteredLines, line)
+			}
+		} else {
+			nonImportLines = append(nonImportLines, line)
+			if strings.HasPrefix(line, "+") || strings.HasPrefix(line, "-") {
+				nonImportChanges++
+			}
+		}
+	}
+
+	filteredLines = append(filteredLines, nonImportLines...)
+	return strings.Join(filteredLines, "\n"), nonImportChanges > 0 || significantImportChanges
+}
+
+func isValidCommitMessage(message string) bool {
+	// Implement a stricter check for Conventional Commits format
+	pattern := `^(feat|fix|docs|style|refactor|perf|test|chore|ci|build|revert)(\([a-z-]+\))?: [a-z].*[^.]$`
+	matched, _ := regexp.MatchString(pattern, strings.Split(message, "\n")[0])
+	return matched
+}
+
+func promptUserAction(message string, files []string) (string, string) {
+	log.Debug().Str("message", message).Msg("Prompting user for action")
+
+	fileList := strings.Join(files, "\n  ")
+	prompt := fmt.Sprintf("Files to commit:\n  %s\n\nCommit message:\n  %s\n\nDo you want to (c)ommit, (e)dit, or (Q)uit? (c/e/Q) ", fileList, message)
+
+	fmt.Print(prompt)
 
 	reader := bufio.NewReader(os.Stdin)
 	response, err := reader.ReadString('\n')
 	if err != nil {
-		log.Error().Err(err).Msg("Failed to read user input")
-		return false
+		log.Error().Err(err).Msg("failed to read user input")
+		return "quit", ""
 	}
 
 	response = strings.TrimSpace(strings.ToLower(response))
-	result := response == "y" || response == "yes"
-	log.Debug().Str("response", response).Bool("result", result).Msg("User response")
-	return result
+	log.Debug().Str("response", response).Msg("User response")
+
+	switch response {
+	case "c":
+		return "commit", message
+	case "e":
+		editedMessage := editCommitMessage(message)
+		return "edit", editedMessage
+	default:
+		return "quit", ""
+	}
 }
 
-func getTimeFormat(formatString string) string {
-	switch formatString {
-	case "RFC3339":
-		return time.RFC3339
-	case "TimeFormatUnix":
-		return "UNIXTIME"
-	default:
-		return time.RFC3339 // Default to RFC3339 if not specified or unknown
+func editCommitMessage(message string) string {
+	editor := os.Getenv("EDITOR")
+	if editor == "" {
+		editor = "vim" // Default to vim if no EDITOR is set
 	}
+
+	tempFile, err := os.CreateTemp("", "COMMIT_EDITMSG")
+	if err != nil {
+		log.Error().Err(err).Msg("failed to create temporary file")
+		return message
+	}
+	defer os.Remove(tempFile.Name())
+
+	if _, err := tempFile.WriteString(message); err != nil {
+		log.Error().Err(err).Msg("failed to write to temporary file")
+		return message
+	}
+	tempFile.Close()
+
+	cmd := exec.Command(editor, tempFile.Name())
+	cmd.Stdin = os.Stdin
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+
+	if err := cmd.Run(); err != nil {
+		log.Error().Err(err).Msg("failed to run editor")
+		return message
+	}
+
+	editedContent, err := os.ReadFile(tempFile.Name())
+	if err != nil {
+		log.Error().Err(err).Msg("failed to read edited file")
+		return message
+	}
+
+	return strings.TrimSpace(string(editedContent))
 }
