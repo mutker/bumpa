@@ -107,18 +107,18 @@ func main() {
 		log.Fatal().Err(err).Msg("failed to open git repository")
 	}
 
-	commitGen := NewCommitGenerator(cfg, llm, log.Logger, repo)
+	cg := NewCommitGenerator(cfg, llm, log.Logger, repo)
 
-	message, err := commitGen.generate()
+	message, err := cg.generate()
 	if err != nil {
-		if err == ErrNoChanges {
+		if err.Error() == "no changes to commit" {
 			log.Info().Msg("no changes to commit")
 			return
 		}
 		log.Fatal().Err(err).Msg("failed to generate commit message")
 	}
 
-	filesToCommit, err := getFilesToCommit(repo)
+	filesToCommit, err := cg.getFilesToCommit()
 	if err != nil {
 		log.Fatal().Err(err).Msg("failed to get files to commit")
 	}
@@ -133,7 +133,7 @@ func main() {
 		return
 	}
 
-	if err := makeCommit(repo, message, filesToCommit); err != nil {
+	if err := cg.makeCommit(message, filesToCommit); err != nil {
 		log.Fatal().Err(err).Msg("failed to commit")
 	}
 
@@ -147,7 +147,7 @@ func loadConfig() (*Config, error) {
 	viper.AutomaticEnv()
 
 	viper.SetDefault("llm.provider", "ollama")
-	viper.SetDefault("llm.model", "llama3.1:8b-instruct-q8_0")
+	viper.SetDefault("llm.model", "llama3.2:latest")
 	viper.SetDefault("llm.base_url", "http://localhost:11434")
 	viper.SetDefault("llm.api_key", "")
 	viper.SetDefault("logging.environment", "development")
@@ -213,6 +213,17 @@ func initLogger() error {
 	log.Logger = logger
 
 	return nil
+}
+
+func getTimeFormat(formatString string) string {
+	switch formatString {
+	case "RFC3339":
+		return time.RFC3339
+	case "TimeFormatUnix":
+		return "UNIXTIME"
+	default:
+		return time.RFC3339 // Default to RFC3339 if not specified or unknown
+	}
 }
 
 func initLLM(ctx context.Context, cfg *Config) (LLMClient, error) {
@@ -309,8 +320,6 @@ func NewCommitGenerator(cfg *Config, llm LLMClient, logger zerolog.Logger, repo 
 	return &CommitGenerator{cfg: cfg, llm: llm, logger: logger, repo: repo}
 }
 
-var ErrNoChanges = fmt.Errorf("no changes to commit")
-
 func (cg *CommitGenerator) generate() (string, error) {
 	fileSummaries, err := cg.getFileSummaries()
 	if err != nil {
@@ -318,7 +327,7 @@ func (cg *CommitGenerator) generate() (string, error) {
 	}
 
 	if len(fileSummaries) == 0 {
-		return "", ErrNoChanges
+		return "", fmt.Errorf("no changes to commit")
 	}
 
 	diffSummary := cg.generateDiffSummary(fileSummaries)
@@ -481,7 +490,7 @@ func (cg *CommitGenerator) generateFileSummary(path string, status *git.FileStat
 		return "", fmt.Errorf("failed to get diff for %s: %w", path, err)
 	}
 
-	filteredDiff, hasSignificantChanges := filterImportChanges(diff)
+	filteredDiff, hasSignificantChanges := cg.filterImportChanges(diff)
 
 	input := map[string]interface{}{
 		"file":                  path,
@@ -599,7 +608,67 @@ func (cg *CommitGenerator) isLargeRefactor(summary string) bool {
 	return fileCount > 5 || keywordCount > 3 || structuralChanges || nonImportChanges > 3
 }
 
-func filterImportChanges(diff string) (string, bool) {
+func (cg *CommitGenerator) getFilesToCommit() ([]string, error) {
+	w, err := cg.repo.Worktree()
+	if err != nil {
+		return nil, err
+	}
+
+	status, err := w.Status()
+	if err != nil {
+		return nil, err
+	}
+
+	var files []string
+	for file, fileStatus := range status {
+		if fileStatus.Staging != git.Unmodified || fileStatus.Worktree != git.Unmodified {
+			files = append(files, file)
+		}
+	}
+
+	sort.Strings(files)
+	return files, nil
+}
+
+func (cg *CommitGenerator) makeCommit(message string, filesToAdd []string) error {
+	w, err := cg.repo.Worktree()
+	if err != nil {
+		return err
+	}
+
+	for _, file := range filesToAdd {
+		_, err := w.Add(file)
+		if err != nil {
+			return fmt.Errorf("failed to add file %s: %w", file, err)
+		}
+	}
+
+	cfg, err := cg.repo.Config()
+	if err != nil {
+		return fmt.Errorf("failed to get git config: %w", err)
+	}
+
+	name := cfg.User.Name
+	email := cfg.User.Email
+
+	if name == "" || email == "" {
+		return fmt.Errorf("git user name or email not set in .git/config")
+	}
+
+	commitOptions := &git.CommitOptions{
+		Author: &object.Signature{
+			Name:  name,
+			Email: email,
+			When:  time.Now(),
+		},
+		All: true,
+	}
+
+	_, err = w.Commit(message, commitOptions)
+	return err
+}
+
+func (cg *CommitGenerator) filterImportChanges(diff string) (string, bool) {
 	lines := strings.Split(diff, "\n")
 	var filteredLines []string
 	var nonImportLines []string
@@ -652,66 +721,6 @@ func extractConventionalCommit(message string) string {
 	return ""
 }
 
-func getFilesToCommit(repo *git.Repository) ([]string, error) {
-	w, err := repo.Worktree()
-	if err != nil {
-		return nil, err
-	}
-
-	status, err := w.Status()
-	if err != nil {
-		return nil, err
-	}
-
-	var files []string
-	for file, fileStatus := range status {
-		if fileStatus.Staging != git.Unmodified || fileStatus.Worktree != git.Unmodified {
-			files = append(files, file)
-		}
-	}
-
-	sort.Strings(files)
-	return files, nil
-}
-
-func makeCommit(repo *git.Repository, message string, filesToAdd []string) error {
-	w, err := repo.Worktree()
-	if err != nil {
-		return err
-	}
-
-	for _, file := range filesToAdd {
-		_, err := w.Add(file)
-		if err != nil {
-			return fmt.Errorf("failed to add file %s: %w", file, err)
-		}
-	}
-
-	cfg, err := repo.Config()
-	if err != nil {
-		return fmt.Errorf("failed to get git config: %w", err)
-	}
-
-	name := cfg.User.Name
-	email := cfg.User.Email
-
-	if name == "" || email == "" {
-		return fmt.Errorf("git user name or email not set in .git/config")
-	}
-
-	commitOptions := &git.CommitOptions{
-		Author: &object.Signature{
-			Name:  name,
-			Email: email,
-			When:  time.Now(),
-		},
-		All: true,
-	}
-
-	_, err = w.Commit(message, commitOptions)
-	return err
-}
-
 func promptYesNo(message string, files []string) bool {
 	log.Debug().Str("message", message).Msg("Prompting user for confirmation")
 
@@ -731,15 +740,4 @@ func promptYesNo(message string, files []string) bool {
 	result := response == "y" || response == "yes"
 	log.Debug().Str("response", response).Bool("result", result).Msg("User response")
 	return result
-}
-
-func getTimeFormat(formatString string) string {
-	switch formatString {
-	case "RFC3339":
-		return time.RFC3339
-	case "TimeFormatUnix":
-		return "UNIXTIME"
-	default:
-		return time.RFC3339 // Default to RFC3339 if not specified or unknown
-	}
 }
