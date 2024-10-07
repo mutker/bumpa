@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"sort"
@@ -16,6 +17,7 @@ import (
 	"github.com/firebase/genkit/go/ai"
 	"github.com/firebase/genkit/go/plugins/ollama"
 	"github.com/go-git/go-git/v5"
+	"github.com/go-git/go-git/v5/plumbing"
 	"github.com/go-git/go-git/v5/plumbing/format/gitignore"
 	"github.com/go-git/go-git/v5/plumbing/object"
 	"github.com/rs/zerolog"
@@ -46,10 +48,11 @@ type Config struct {
 	}
 
 	LLM struct {
-		Provider string
-		Model    string
-		BaseURL  string `mapstructure:"base_url"`
-		APIKey   string `mapstructure:"api_key"`
+		Provider   string
+		Model      string
+		BaseURL    string `mapstructure:"base_url"`
+		APIKey     string `mapstructure:"api_key"`
+		MaxRetries int    `mapstructure:"max_retries"`
 	}
 
 	Tools []Tool `mapstructure:"tools"`
@@ -101,7 +104,6 @@ func main() {
 		log.Fatal().Err(err).Msg("failed to initialize LLM")
 	}
 
-	// Open the existing repository
 	repo, err := git.PlainOpen(".")
 	if err != nil {
 		log.Fatal().Err(err).Msg("failed to open git repository")
@@ -128,16 +130,21 @@ func main() {
 		return
 	}
 
-	if !promptYesNo(message, filesToCommit) {
+	action, editedMessage := promptUserAction(message, filesToCommit)
+	switch action {
+	case "commit":
+		if err := cg.makeCommit(message, filesToCommit); err != nil {
+			log.Fatal().Err(err).Msg("failed to commit")
+		}
+		log.Info().Msg("commit successfully created")
+	case "edit":
+		if err := cg.makeCommit(editedMessage, filesToCommit); err != nil {
+			log.Fatal().Err(err).Msg("failed to commit")
+		}
+		log.Info().Msg("commit successfully created with edited message")
+	case "quit":
 		log.Info().Msg("commit aborted")
-		return
 	}
-
-	if err := cg.makeCommit(message, filesToCommit); err != nil {
-		log.Fatal().Err(err).Msg("failed to commit")
-	}
-
-	log.Info().Msg("commit successfully created")
 }
 
 func loadConfig() (*Config, error) {
@@ -346,6 +353,15 @@ func (cg *CommitGenerator) generate() (string, error) {
 	return commitMessage, nil
 }
 
+func (cg *CommitGenerator) findTool(name string) *Tool {
+	for _, tool := range cg.cfg.Tools {
+		if tool.Name == name {
+			return &tool
+		}
+	}
+	return nil
+}
+
 func (cg *CommitGenerator) shouldIgnoreFile(path string) bool {
 	// Check against the ignore list in the config
 	for _, pattern := range cg.cfg.Git.Ignore {
@@ -379,8 +395,14 @@ func (cg *CommitGenerator) shouldIgnoreFile(path string) bool {
 }
 
 func (cg *CommitGenerator) generateDiffSummary(fileSummaries map[string]string) string {
+	branchName, err := cg.getCurrentBranch()
+	if err != nil {
+		log.Warn().Err(err).Msg("failed to get current branch name")
+		branchName = "unknown"
+	}
+
 	var summaryBuilder strings.Builder
-	summaryBuilder.WriteString("Changes in multiple files:\n\n")
+	summaryBuilder.WriteString(fmt.Sprintf("Changes on branch '%s':\n\n", branchName))
 	for file, summary := range fileSummaries {
 		summaryBuilder.WriteString(fmt.Sprintf("- %s: %s\n", file, summary))
 	}
@@ -400,6 +422,48 @@ func (cg *CommitGenerator) getFileStatus(status *git.FileStatus) string {
 	default:
 		return "Changed"
 	}
+}
+
+func (cg *CommitGenerator) getCurrentBranch() (string, error) {
+	head, err := cg.repo.Head()
+	if err != nil {
+		return "", fmt.Errorf("failed to get HEAD: %w", err)
+	}
+
+	if head.Name().IsBranch() {
+		return head.Name().Short(), nil
+	}
+
+	// If HEAD is detached, try to find the closest branch
+	refs, err := cg.repo.References()
+	if err != nil {
+		return "", fmt.Errorf("failed to get references: %w", err)
+	}
+
+	var closestBranch string
+	var closestCommit *object.Commit
+	err = refs.ForEach(func(ref *plumbing.Reference) error {
+		if ref.Name().IsBranch() {
+			commit, err := cg.repo.CommitObject(ref.Hash())
+			if err != nil {
+				return nil // Skip this reference
+			}
+			if closestCommit == nil || commit.Committer.When.After(closestCommit.Committer.When) {
+				closestBranch = ref.Name().Short()
+				closestCommit = commit
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return "", fmt.Errorf("failed to iterate over references: %w", err)
+	}
+
+	if closestBranch == "" {
+		return "DETACHED_HEAD", nil
+	}
+
+	return closestBranch, nil
 }
 
 func (cg *CommitGenerator) getFileDiff(path string) (string, error) {
@@ -499,7 +563,12 @@ func (cg *CommitGenerator) generateFileSummary(path string, status *git.FileStat
 		"hasSignificantChanges": hasSignificantChanges,
 	}
 
-	summary, err := cg.llm.CallTool(ctx, "generate_file_summary", input)
+	tool := cg.findTool("generate_file_summary")
+	if tool == nil {
+		return "", fmt.Errorf("generate_file_summary tool not found in configuration")
+	}
+
+	summary, err := cg.llm.CallTool(ctx, tool.Name, input)
 	if err != nil {
 		return "", fmt.Errorf("failed to generate file summary: %w", err)
 	}
@@ -542,22 +611,29 @@ func (cg *CommitGenerator) generateCommitMessageFromSummary(summary string) (str
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	isLargeRefactor := cg.isLargeRefactor(summary)
+	branchName, err := cg.getCurrentBranch()
+	if err != nil {
+		log.Warn().Err(err).Msg("Failed to get current branch name")
+		branchName = "unknown"
+	}
 
 	input := map[string]interface{}{
 		"summary": summary,
-		"instructions": "Generate a concise and meaningful commit message that accurately describes the main changes. " +
-			"Focus on the most significant modifications and their purpose, prioritizing changes to code structure, functionality, or behavior over minor changes like import reorganizations. " +
-			"If there are significant non-import changes, highlight those in the commit message. " +
-			"Avoid mentioning minor changes unless they are the only changes. " +
-			"Do not end the description with a period. " +
-			"If the changes involve a large refactor, use the 'refactor' type and consider adding an appropriate scope. " +
-			"Ensure the message follows the Conventional Commits format.",
-		"isLargeRefactor": isLargeRefactor,
+		"branch":  branchName,
 	}
 
-	for attempts := 0; attempts < 3; attempts++ {
-		message, err := cg.llm.CallTool(ctx, "generate_conventional_commit", input)
+	tool := cg.findTool("generate_conventional_commit")
+	if tool == nil {
+		return "", fmt.Errorf("generate_conventional_commit tool not found in configuration")
+	}
+
+	maxRetries := cg.cfg.LLM.MaxRetries
+	if maxRetries < 1 {
+		maxRetries = 1 // Ensure at least one attempt is made
+	}
+
+	for retries := 0; retries < maxRetries; retries++ {
+		message, err := cg.llm.CallTool(ctx, tool.Name, input)
 		if err != nil {
 			return "", fmt.Errorf("failed to generate commit message: %w", err)
 		}
@@ -571,41 +647,13 @@ func (cg *CommitGenerator) generateCommitMessageFromSummary(summary string) (str
 			return message, nil
 		}
 
-		// If invalid, try to extract a valid message
-		extractedMessage := extractConventionalCommit(message)
-		if extractedMessage != "" {
-			return extractedMessage, nil
+		// If invalid and not the last attempt, update the input and try again
+		if retries < maxRetries-1 {
+			input["summary"] = fmt.Sprintf("The previous response was invalid. Please generate a commit message in the Conventional Commits format. It should start with a type (feat, fix, refactor, etc.) followed by a colon and a short description. Do not end with a period. Consider the branch name '%s'. Here's the summary again:\n\n%s", branchName, summary)
 		}
-
-		// If extraction fails, update the input and try again
-		input["summary"] = fmt.Sprintf("The previous response was invalid. Please generate a commit message in the Conventional Commits format. It should start with a type (feat, fix, refactor, etc.) followed by a colon and a short description. Do not end with a period. Here's the summary again:\n\n%s", summary)
 	}
 
-	return "", fmt.Errorf("failed to generate a valid commit message after multiple attempts")
-}
-
-func (cg *CommitGenerator) isLargeRefactor(summary string) bool {
-	fileCount := strings.Count(summary, "\n- ")
-
-	refactorKeywords := []string{
-		"refactor", "restructure", "reorganize", "rewrite",
-		"change", "modify", "update", "revise", "overhaul",
-		"implement", "add", "remove", "delete", "introduce",
-	}
-	keywordCount := 0
-	for _, keyword := range refactorKeywords {
-		keywordCount += strings.Count(strings.ToLower(summary), keyword)
-	}
-
-	structuralChanges := strings.Contains(summary, "Removed struct") ||
-		strings.Contains(summary, "Added struct") ||
-		strings.Contains(summary, "Changed interface") ||
-		strings.Contains(summary, "Modified function") ||
-		strings.Contains(summary, "Added method")
-
-	nonImportChanges := strings.Count(summary, "significant changes")
-
-	return fileCount > 5 || keywordCount > 3 || structuralChanges || nonImportChanges > 3
+	return "", fmt.Errorf("failed to generate a valid commit message after %d attempts", maxRetries)
 }
 
 func (cg *CommitGenerator) getFilesToCommit() ([]string, error) {
@@ -711,21 +759,11 @@ func isValidCommitMessage(message string) bool {
 	return matched
 }
 
-func extractConventionalCommit(message string) string {
-	lines := strings.Split(message, "\n")
-	for _, line := range lines {
-		if isValidCommitMessage(line) {
-			return line
-		}
-	}
-	return ""
-}
-
-func promptYesNo(message string, files []string) bool {
-	log.Debug().Str("message", message).Msg("Prompting user for confirmation")
+func promptUserAction(message string, files []string) (string, string) {
+	log.Debug().Str("message", message).Msg("Prompting user for action")
 
 	fileList := strings.Join(files, "\n  ")
-	prompt := fmt.Sprintf("Files to commit:\n  %s\n\nCommit message:\n  %s\n\nDo you want to commit the following files with the message? (y/N) ", fileList, message)
+	prompt := fmt.Sprintf("Files to commit:\n  %s\n\nCommit message:\n  %s\n\nDo you want to (c)ommit, (e)dit, or (Q)uit? (c/e/Q) ", fileList, message)
 
 	fmt.Print(prompt)
 
@@ -733,11 +771,57 @@ func promptYesNo(message string, files []string) bool {
 	response, err := reader.ReadString('\n')
 	if err != nil {
 		log.Error().Err(err).Msg("failed to read user input")
-		return false
+		return "quit", ""
 	}
 
 	response = strings.TrimSpace(strings.ToLower(response))
-	result := response == "y" || response == "yes"
-	log.Debug().Str("response", response).Bool("result", result).Msg("User response")
-	return result
+	log.Debug().Str("response", response).Msg("User response")
+
+	switch response {
+	case "c":
+		return "commit", message
+	case "e":
+		editedMessage := editCommitMessage(message)
+		return "edit", editedMessage
+	default:
+		return "quit", ""
+	}
+}
+
+func editCommitMessage(message string) string {
+	editor := os.Getenv("EDITOR")
+	if editor == "" {
+		editor = "vim" // Default to vim if no EDITOR is set
+	}
+
+	tempFile, err := os.CreateTemp("", "COMMIT_EDITMSG")
+	if err != nil {
+		log.Error().Err(err).Msg("failed to create temporary file")
+		return message
+	}
+	defer os.Remove(tempFile.Name())
+
+	if _, err := tempFile.WriteString(message); err != nil {
+		log.Error().Err(err).Msg("failed to write to temporary file")
+		return message
+	}
+	tempFile.Close()
+
+	cmd := exec.Command(editor, tempFile.Name())
+	cmd.Stdin = os.Stdin
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+
+	if err := cmd.Run(); err != nil {
+		log.Error().Err(err).Msg("failed to run editor")
+		return message
+	}
+
+	editedContent, err := os.ReadFile(tempFile.Name())
+	if err != nil {
+		log.Error().Err(err).Msg("failed to read edited file")
+		return message
+	}
+
+	return strings.TrimSpace(string(editedContent))
 }

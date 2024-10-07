@@ -14,19 +14,21 @@
 - [x] Implement LLM integration
   - [x] Set up Ollama client
   - [x] Set up OpenAI client
-- [ ] Implement tool use
+- [x] Implement tool use
 - [ ] Implement caching mechanism for LLM responses
 
 ## CLI Commands
 - [x] Implement `commit` command
   - [x] Analyze git diff
-  - [x] Generate commit message using LLM
+  - [x] Implement retry mechanism
   - [x] Generate a summary per file to minimize token use
-- [ ] Implement `pr` command
+- [ ] Implement `bump` (version bump) command
 - [ ] Implement `changelog` command
-- [ ] Implement `bump` command
-- [ ] Implement `release-notes` command
-- [ ] Implement a dry-run mode for all commands
+- [ ] Implement `rel` (release notes) command
+- [ ] Implement `pr` (pull request) command
+  - [ ] Support for codeberg.org
+  - [ ] Support for GitLab
+  - [ ] Support for GitHub
 
 ## Testing
 - [ ] Set up testing framework and mocks
