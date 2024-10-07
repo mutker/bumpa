@@ -40,6 +40,60 @@ templates:
 
     {% if .Footer %}{{.Footer}}{% endif %}
 
+tools:
+  - name: generate_conventional_commit
+    description: |
+      Generates a single, concise, and meaningful Git commit message that strictly adheres to the Conventional Commits 1.0.0 specification. This tool summarizes changes across multiple files into one commit message.
+
+      The commit message structure is as follows:
+      <type>[optional scope][!]: <description>
+
+      [optional body]
+
+      [optional footer(s)]
+
+      Key rules:
+      1. Commits MUST be prefixed with a type, which consists of feat, fix, or other allowed types.
+      2. A scope MAY be provided after a type, within parentheses.
+      3. A description MUST immediately follow the colon and space after the type/scope prefix.
+      4. A longer commit body MAY be provided after the short description.
+      5. A footer MAY be provided after the body, following the 'git trailer' convention.
+      6. Breaking changes MUST be indicated by a '!' before the ':' or as a 'BREAKING CHANGE:' footer.
+
+      This tool helps maintain a standardized Git history, aiding in automated CHANGELOG generation and semantic versioning.
+    input_schema: |
+      {
+        "type": "object",
+        "properties": {
+          "type": {
+            "type": "string",
+            "enum": ["feat", "fix", "docs", "style", "refactor", "perf", "test", "build", "ci", "chore", "revert"],
+            "description": "The type of the commit"
+          },
+          "scope": {
+            "type": "string",
+            "description": "Optional scope of the commit"
+          },
+          "is_breaking_change": {
+            "type": "boolean",
+            "description": "Indicates if this commit contains breaking changes"
+          },
+          "description": {
+            "type": "string",
+            "description": "A short description of the code changes"
+          },
+          "body": {
+            "type": "string",
+            "description": "Optional longer description of the changes"
+          },
+          "footer": {
+            "type": "string",
+            "description": "Optional footer (e.g., BREAKING CHANGE explanation)"
+          }
+        },
+        "required": ["type", "description"]
+      }
+
 prompts:
   diff_summary:
     system: |

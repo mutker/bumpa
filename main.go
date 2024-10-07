@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"os"
@@ -15,6 +16,7 @@ import (
 	"github.com/firebase/genkit/go/ai"
 	"github.com/firebase/genkit/go/plugins/ollama"
 	"github.com/go-git/go-git/v5"
+	"github.com/go-git/go-git/v5/plumbing/format/gitignore"
 	"github.com/go-git/go-git/v5/plumbing/object"
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
@@ -50,38 +52,13 @@ type Config struct {
 		APIKey   string `mapstructure:"api_key"`
 	}
 
-	Prompts struct {
-		DiffSummary struct {
-			System, User string
-		}
-		CommitMessage struct {
-			System, User string
-		}
-		FileSummary struct {
-			System, User string
-		}
-	}
-	Templates struct {
-		CommitMessage string
-	}
-	Commit CommitConfig
+	Tools []Tool `mapstructure:"tools"`
 }
 
-type CommitConfig struct {
-	IncludeGitignore bool
-	Ignore           []string
-	Templates        struct {
-		CommitMessage string
-	}
-	Prompts struct {
-		DiffSummary   PromptPair
-		CommitMessage PromptPair
-		FileSummary   PromptPair
-	}
-}
-
-type PromptPair struct {
-	System, User string
+type Tool struct {
+	Name        string          `json:"name"`
+	Description string          `json:"description"`
+	InputSchema json.RawMessage `json:"input_schema"`
 }
 
 type CommitGenerator struct {
@@ -92,7 +69,7 @@ type CommitGenerator struct {
 }
 
 type LLMClient interface {
-	GenerateText(ctx context.Context, systemPrompt, userPrompt string) (string, error)
+	CallTool(ctx context.Context, toolName string, input interface{}) (string, error)
 }
 
 type OllamaClient struct {
@@ -151,15 +128,7 @@ func main() {
 		return
 	}
 
-	fileList := strings.Builder{}
-	fileList.WriteString("Files:\n")
-	for _, file := range filesToCommit {
-		fileList.WriteString(fmt.Sprintf("  %s\n", file))
-	}
-
-	promptMessage := fmt.Sprintf("%s\nDo you want to commit the following files with the message: %q?", fileList.String(), message)
-
-	if !promptYesNo(promptMessage) {
+	if !promptYesNo(message, filesToCommit) {
 		log.Info().Msg("commit aborted")
 		return
 	}
@@ -290,14 +259,17 @@ func initOpenAIClient(cfg *Config) (*OpenAIClient, error) {
 	}, nil
 }
 
-func (c *OllamaClient) GenerateText(ctx context.Context, systemPrompt, userPrompt string) (string, error) {
-	if c.model == nil {
-		return "", fmt.Errorf("failed to initialize Ollama model")
+func (c *OllamaClient) CallTool(ctx context.Context, toolName string, input interface{}) (string, error) {
+	inputJSON, err := json.Marshal(input)
+	if err != nil {
+		return "", fmt.Errorf("failed to marshal tool input: %w", err)
 	}
+
+	prompt := fmt.Sprintf("Use the %s tool with the following input:\n%s", toolName, string(inputJSON))
 	log.Debug().Msg("Sending request to Ollama")
 	result, err := ai.GenerateText(ctx, c.model,
-		ai.WithSystemPrompt(systemPrompt),
-		ai.WithTextPrompt(userPrompt))
+		ai.WithSystemPrompt(""),
+		ai.WithTextPrompt(prompt))
 	if err != nil {
 		return "", fmt.Errorf("failed request to Ollama: %w", err)
 	}
@@ -305,7 +277,12 @@ func (c *OllamaClient) GenerateText(ctx context.Context, systemPrompt, userPromp
 	return result, nil
 }
 
-func (c *OpenAIClient) GenerateText(ctx context.Context, systemPrompt, userPrompt string) (string, error) {
+func (c *OpenAIClient) CallTool(ctx context.Context, toolName string, input interface{}) (string, error) {
+	inputJSON, err := json.Marshal(input)
+	if err != nil {
+		return "", fmt.Errorf("failed to marshal tool input: %w", err)
+	}
+
 	resp, err := c.client.CreateChatCompletion(
 		ctx,
 		openai.ChatCompletionRequest{
@@ -313,17 +290,17 @@ func (c *OpenAIClient) GenerateText(ctx context.Context, systemPrompt, userPromp
 			Messages: []openai.ChatCompletionMessage{
 				{
 					Role:    openai.ChatMessageRoleSystem,
-					Content: systemPrompt,
+					Content: fmt.Sprintf("You are an AI assistant that uses the %s tool.", toolName),
 				},
 				{
 					Role:    openai.ChatMessageRoleUser,
-					Content: userPrompt,
+					Content: fmt.Sprintf("Use the %s tool with the following input:\n%s", toolName, string(inputJSON)),
 				},
 			},
 		},
 	)
 	if err != nil {
-		return "", fmt.Errorf("failed to generate text: %w", err)
+		return "", fmt.Errorf("failed to call OpenAI API: %w", err)
 	}
 	return resp.Choices[0].Message.Content, nil
 }
@@ -349,11 +326,14 @@ func (cg *CommitGenerator) generate() (string, error) {
 
 	commitMessage, err := cg.generateCommitMessageFromSummary(diffSummary)
 	if err != nil {
-		log.Fatal().Err(err).Msg("Failed to generate valid commit message")
-		return "", err // This line is technically unnecessary due to log.Fatal, but included for clarity
+		log.Error().Err(err).Msg("Failed to generate valid commit message")
+		return "", err
 	}
 
-	log.Info().Str("message", commitMessage).Msg("Generated commit message")
+	// Remove trailing period if present
+	commitMessage = strings.TrimSuffix(commitMessage, ".")
+
+	log.Info().Str("message", commitMessage).Msgf("Generated commit message: %s", commitMessage)
 	return commitMessage, nil
 }
 
@@ -366,7 +346,26 @@ func (cg *CommitGenerator) shouldIgnoreFile(path string) bool {
 		}
 	}
 
-	// FIXME: We're not checking against .gitignore in this in-memory approach
+	// Check against .gitignore if IncludeGitignore is true
+	if cg.cfg.Git.IncludeGitignore {
+		wt, err := cg.repo.Worktree()
+		if err != nil {
+			log.Error().Err(err).Msg("Failed to get worktree")
+			return false
+		}
+
+		patterns, err := gitignore.ReadPatterns(wt.Filesystem, nil)
+		if err != nil {
+			log.Error().Err(err).Msg("Failed to read gitignore patterns")
+			return false
+		}
+
+		matcher := gitignore.NewMatcher(patterns)
+		if matcher.Match([]string{path}, false) {
+			return true
+		}
+	}
+
 	return false
 }
 
@@ -482,10 +481,16 @@ func (cg *CommitGenerator) generateFileSummary(path string, status *git.FileStat
 		return "", fmt.Errorf("failed to get diff for %s: %w", path, err)
 	}
 
-	prompt := cg.cfg.Commit.Prompts.FileSummary
-	fileSummaryPrompt := fmt.Sprintf(prompt.User, path, cg.getFileStatus(status), diff)
+	filteredDiff, hasSignificantChanges := filterImportChanges(diff)
 
-	summary, err := cg.llm.GenerateText(ctx, prompt.System, fileSummaryPrompt)
+	input := map[string]interface{}{
+		"file":                  path,
+		"status":                cg.getFileStatus(status),
+		"diff":                  filteredDiff,
+		"hasSignificantChanges": hasSignificantChanges,
+	}
+
+	summary, err := cg.llm.CallTool(ctx, "generate_file_summary", input)
 	if err != nil {
 		return "", fmt.Errorf("failed to generate file summary: %w", err)
 	}
@@ -528,18 +533,30 @@ func (cg *CommitGenerator) generateCommitMessageFromSummary(summary string) (str
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	systemPrompt := cg.cfg.Prompts.CommitMessage.System
-	userPrompt := fmt.Sprintf(cg.cfg.Prompts.CommitMessage.User, summary)
+	isLargeRefactor := cg.isLargeRefactor(summary)
+
+	input := map[string]interface{}{
+		"summary": summary,
+		"instructions": "Generate a concise and meaningful commit message that accurately describes the main changes. " +
+			"Focus on the most significant modifications and their purpose, prioritizing changes to code structure, functionality, or behavior over minor changes like import reorganizations. " +
+			"If there are significant non-import changes, highlight those in the commit message. " +
+			"Avoid mentioning minor changes unless they are the only changes. " +
+			"Do not end the description with a period. " +
+			"If the changes involve a large refactor, use the 'refactor' type and consider adding an appropriate scope. " +
+			"Ensure the message follows the Conventional Commits format.",
+		"isLargeRefactor": isLargeRefactor,
+	}
 
 	for attempts := 0; attempts < 3; attempts++ {
-		log.Debug().Str("systemPrompt", systemPrompt).Str("userPrompt", userPrompt).Msg("Sending prompts to LLM")
-
-		message, err := cg.llm.GenerateText(ctx, systemPrompt, userPrompt)
+		message, err := cg.llm.CallTool(ctx, "generate_conventional_commit", input)
 		if err != nil {
 			return "", fmt.Errorf("failed to generate commit message: %w", err)
 		}
 
 		log.Debug().Str("generatedMessage", message).Msg("Received message from LLM")
+
+		// Remove trailing period if present
+		message = strings.TrimSuffix(message, ".")
 
 		if isValidCommitMessage(message) {
 			return message, nil
@@ -551,66 +568,76 @@ func (cg *CommitGenerator) generateCommitMessageFromSummary(summary string) (str
 			return extractedMessage, nil
 		}
 
-		// If extraction fails, update the prompt and try again
-		userPrompt = fmt.Sprintf("The previous response was invalid. Please generate a commit message in the Conventional Commits format. It should start with a type (feat, fix, etc.) followed by a colon and a short description. Here's the summary again:\n\n%s", summary)
+		// If extraction fails, update the input and try again
+		input["summary"] = fmt.Sprintf("The previous response was invalid. Please generate a commit message in the Conventional Commits format. It should start with a type (feat, fix, refactor, etc.) followed by a colon and a short description. Do not end with a period. Here's the summary again:\n\n%s", summary)
 	}
 
 	return "", fmt.Errorf("failed to generate a valid commit message after multiple attempts")
 }
 
-func (cg *CommitGenerator) processCommitMessage(message string) string {
-	message = strings.TrimSpace(message)
-	lines := strings.Split(message, "\n")
+func (cg *CommitGenerator) isLargeRefactor(summary string) bool {
+	fileCount := strings.Count(summary, "\n- ")
 
-	// Extract the first line that matches the Conventional Commit format
-	var header string
-	for _, line := range lines {
-		if isValidCommitMessage(line) {
-			header = line
-			break
-		}
+	refactorKeywords := []string{
+		"refactor", "restructure", "reorganize", "rewrite",
+		"change", "modify", "update", "revise", "overhaul",
+		"implement", "add", "remove", "delete", "introduce",
+	}
+	keywordCount := 0
+	for _, keyword := range refactorKeywords {
+		keywordCount += strings.Count(strings.ToLower(summary), keyword)
 	}
 
-	if header == "" {
-		log.Error().Str("invalidMessage", message).Msg("Generated commit message is not in the expected format")
-		return ""
-	}
+	structuralChanges := strings.Contains(summary, "Removed struct") ||
+		strings.Contains(summary, "Added struct") ||
+		strings.Contains(summary, "Changed interface") ||
+		strings.Contains(summary, "Modified function") ||
+		strings.Contains(summary, "Added method")
 
-	if len(header) > 100 {
-		log.Warn().Str("header", header).Msg("Commit message header exceeds 100 characters")
-		header = header[:100]
-	}
+	nonImportChanges := strings.Count(summary, "significant changes")
 
-	// Construct the body from the remaining lines
-	var body strings.Builder
-	for _, line := range lines[1:] {
-		if len(line) > 100 {
-			line = line[:100]
-		}
-		body.WriteString(line)
-		body.WriteString("\n")
-	}
-
-	if body.Len() > 0 {
-		return fmt.Sprintf("%s\n\n%s", header, strings.TrimSpace(body.String()))
-	}
-
-	return header
+	return fileCount > 5 || keywordCount > 3 || structuralChanges || nonImportChanges > 3
 }
 
-func isValidCommitType(message string) bool {
-	validTypes := []string{"feat", "fix", "docs", "style", "refactor", "perf", "test", "chore", "ci", "build", "revert"}
-	for _, validType := range validTypes {
-		if strings.HasPrefix(strings.ToLower(message), validType+":") || strings.HasPrefix(strings.ToLower(message), validType+"(") {
-			return true
+func filterImportChanges(diff string) (string, bool) {
+	lines := strings.Split(diff, "\n")
+	var filteredLines []string
+	var nonImportLines []string
+	inImportBlock := false
+	significantImportChanges := false
+	nonImportChanges := 0
+
+	for _, line := range lines {
+		if strings.HasPrefix(line, "import (") {
+			inImportBlock = true
+			filteredLines = append(filteredLines, line)
+			continue
+		}
+		if inImportBlock && strings.HasPrefix(line, ")") {
+			inImportBlock = false
+			filteredLines = append(filteredLines, line)
+			continue
+		}
+		if inImportBlock {
+			if strings.HasPrefix(line, "+") || strings.HasPrefix(line, "-") {
+				significantImportChanges = true
+				filteredLines = append(filteredLines, line)
+			}
+		} else {
+			nonImportLines = append(nonImportLines, line)
+			if strings.HasPrefix(line, "+") || strings.HasPrefix(line, "-") {
+				nonImportChanges++
+			}
 		}
 	}
-	return false
+
+	filteredLines = append(filteredLines, nonImportLines...)
+	return strings.Join(filteredLines, "\n"), nonImportChanges > 0 || significantImportChanges
 }
 
 func isValidCommitMessage(message string) bool {
 	// Implement a stricter check for Conventional Commits format
-	pattern := `^(feat|fix|docs|style|refactor|perf|test|chore|ci|build|revert)(\([a-z]+\))?: [a-z].+`
+	pattern := `^(feat|fix|docs|style|refactor|perf|test|chore|ci|build|revert)(\([a-z-]+\))?: [a-z].*[^.]$`
 	matched, _ := regexp.MatchString(pattern, strings.Split(message, "\n")[0])
 	return matched
 }
@@ -685,14 +712,18 @@ func makeCommit(repo *git.Repository, message string, filesToAdd []string) error
 	return err
 }
 
-func promptYesNo(question string) bool {
-	log.Debug().Str("question", question).Msg("Prompting user for confirmation")
-	fmt.Printf("%s (y/N): ", question)
+func promptYesNo(message string, files []string) bool {
+	log.Debug().Str("message", message).Msg("Prompting user for confirmation")
+
+	fileList := strings.Join(files, "\n  ")
+	prompt := fmt.Sprintf("Files to commit:\n  %s\n\nCommit message:\n  %s\n\nDo you want to commit the following files with the message? (y/N) ", fileList, message)
+
+	fmt.Print(prompt)
 
 	reader := bufio.NewReader(os.Stdin)
 	response, err := reader.ReadString('\n')
 	if err != nil {
-		log.Error().Err(err).Msg("Failed to read user input")
+		log.Error().Err(err).Msg("failed to read user input")
 		return false
 	}
 
