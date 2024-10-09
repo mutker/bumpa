@@ -1,34 +1,47 @@
 # TODO
 
-## Core Functionality
+## Setup
 - [x] Implement configuration loading
   - [x] Use Viper for YAML config parsing
   - [x] Define configuration struct
-- [x] Implement error handling
-- [x] Add detailed logging for debugging and monitoring
-- [ ] Implement version bumping logic
-  - [ ] Parse and update VERSION file
-  - [ ] Implement semantic versioning rules
-
-## LLM Integration
-- [x] Implement LLM integration
+- [x] Implement logging facilities
+  - [x] Implement LLM integration
   - [x] Set up Ollama client
   - [x] Set up OpenAI client
-- [x] Implement tool use
-- [ ] Implement caching mechanism for LLM responses
+- [ ] Setup proper project structure according to [golang-standards/project-layout](https://github.com/golang-standards/project-layout)
 
-## CLI Commands
+## Features
 - [x] Implement `commit` command
   - [x] Analyze git diff
-  - [x] Implement retry mechanism
+  - [x] Generate commit message using LLM
   - [x] Generate a summary per file to minimize token use
-- [ ] Implement `bump` (version bump) command
+- [ ] Implement `pr` command
 - [ ] Implement `changelog` command
-- [ ] Implement `rel` (release notes) command
-- [ ] Implement `pr` (pull request) command
-  - [ ] Support for codeberg.org
-  - [ ] Support for GitLab
-  - [ ] Support for GitHub
+- [ ] Implement `bump` command
+  - [ ] Implement version bumping logic
+  - [ ] Parse and update VERSION file
+  - [ ] Implement semantic versioning rules
+- [ ] Implement `release-notes` command
+
+## Configuration
+- [x] Add support for custom LLM model configuration
+- [ ] Implement configuration validation
+
+## Git
+- [ ] Create prepare-commit-msg hook
+
+## Documentation
+- [ ] Write godoc comments for all exported functions and types
+- [ ] Create installation instructions
+- [ ] Create usage examples for each command
+- [ ] Create git hook usage examples
+- [ ] Create CONTRIBUTING.md guide
+
+## Packaging and Distribution
+- [ ] Create PKGBUILD and Dockerfile
+- [ ] Set up Goreleaser configuration
+- [ ] Create golangci-lint workflow
+- [ ] Create release workflow
 
 ## Testing
 - [ ] Set up testing framework and mocks
@@ -36,32 +49,5 @@
 - [ ] Write integration tests for CLI commands
 - [ ] Set up mock LLM responses for testing
 
-## Git Integration
-- [ ] Implement .gitignore handling for file ignoring
-- [ ] Create prepare-commit-msg hook script
-- [ ] Implement Git hook installation command
-- [ ] Implement commit signing support
-  - [ ] Add GPG signing option
-  - [ ] Add SSH signing option
-
-## Documentation
-- [ ] Write godoc comments for all exported functions and types
-- [ ] Create usage examples for each command
-- [ ] Update README.md with detailed installation and usage instructions
-- [ ] Create CONTRIBUTING.md guide
-
-## Packaging and Distribution
-- [ ] Set up Goreleaser configuration
-- [ ] Create release workflow for Codeberg CI
-
-## Configuration
-- [x] Add support for custom LLM model configuration
-- [x] Implement configuration validation
-- [ ] Add support for custom templates for PR descriptions and release notes
-
-## Final Steps
-- [ ] Perform code review and refactoring
-- [ ] Conduct security audit
-- [ ] Set up issue templates on Codeberg
-- [ ] Perform end-to-end testing
-- [ ] Update documentation based on final implementation
+## Future
+- [ ] Implement support for additional LLM providers
