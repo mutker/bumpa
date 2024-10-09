@@ -8,7 +8,7 @@
   - [x] Implement LLM integration
   - [x] Set up Ollama client
   - [x] Set up OpenAI client
-- [ ] Setup proper project structure according to [golang-standards/project-layout](https://github.com/golang-standards/project-layout)
+- [x] Setup proper project structure according to [golang-standards/project-layout](https://github.com/golang-standards/project-layout)
 
 ## Features
 - [x] Implement `commit` command

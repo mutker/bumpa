@@ -39,11 +39,11 @@ bumpa [command] [flags]
 ```
 
 Available commands:
-- `commit`: Generate a commit message
-- `pr`: Generate a pull request description
-- `changelog`: Generate a changelog
-- `bump`: Bump the application version
-- `release-notes`: Generate release notes
+  - `commit`: Generate a commit message
+  - `pr`: Generate a pull request description
+  - `changelog`: Generate a changelog
+  - `bump`: Bump the application version
+  - `release-notes`: Generate release notes
 
 ### As a Git commit hook
 
