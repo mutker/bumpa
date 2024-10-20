@@ -1,62 +1,75 @@
-run:
-  timeout: 5m
+linters:
+  enable-all: true
+  disable:
+    - copyloopvar
+    - intrange
+    - depguard
+    - execinquery
+    - exhaustruct
+    - exportloopref
+    - gochecknoglobals
+    - gci # https://github.com/golangci/golangci-lint/issues/1490
+    - godot
+    - gomnd
+    - varnamelen
+    - wsl
+    - zerologlint
 
 linters-settings:
-  gci:
-    sections:
-      - standard
-      - default
-      - prefix(codeberg.org/mutker/bumpa)
+  dupl:
+    threshold: 100
+  funlen:
+    lines: -1 # the number of lines (code + empty lines) is not a right metric and leads to code without empty line or one-liner.
+    statements: 50
+  goconst:
+    min-len: 2
+    min-occurrences: 3
   gocritic:
-    # Enable multiple checks by tags. See "Tags" section in https://github.com/go-critic/go-critic#usage.
     enabled-tags:
       - diagnostic
       - experimental
       - opinionated
+      - performance
       - style
     disabled-checks:
-      - importShadow
-      - unnamedResult
-  goimports:
-    local-prefixes: codeberg.org/mutker/bumpa
-
-linters:
-  disable-all: true
-  enable:
-    - bodyclose
-    - dogsled
-    - dupl
-    - durationcheck
-    - exhaustive
-    - copyloopvar
-    - gci
-    - gocritic
-    - godot
-    - gofmt
-    - gofumpt
-    - goimports
-    - gomoddirectives
-    - goprintffuncname
-    - govet
-    - importas
-    - ineffassign
-    - makezero
-    - misspell
-    - nakedret
-    - nilerr
-    - noctx
-    - nolintlint
-    - prealloc
-    - predeclared
-    - revive
-    - rowserrcheck
-    - sqlclosecheck
-    - staticcheck
-    - stylecheck
-    - tparallel
-    - typecheck
-    - unconvert
-    - unparam
-    - unused
-    - wastedassign
-    - whitespace
+      - dupImport # https://github.com/go-critic/go-critic/issues/845
+      - ifElseChain
+      - octalLiteral
+      - whyNoLint
+  godox:
+    keywords:
+      - FIXME
+  lll:
+    line-length: 140
+  mnd:
+    ignored-functions:
+      - '^v\.SetDefault'
+  misspell:
+    locale: US
+    ignore-words:
+      - "importas" # linter name
+  nestif:
+    # Minimal complexity of if statements to report.
+    # Default: 5
+    min-complexity: 10
+  nlreturn:
+    block-size: 3
+  nolintlint:
+    allow-unused: false # report any unused nolint directives
+    require-explanation: true # require an explanation for nolint directives
+    require-specific: true # require nolint directives to be specific about which linter is being skipped
+  paralleltest:
+    # Ignore missing calls to `t.Parallel()` and only report incorrect uses of it.
+    # Default: false
+    ignore-missing: true
+    # Ignore missing calls to `t.Parallel()` in subtests. Top-level tests are
+    # still required to have `t.Parallel`, but subtests are allowed to skip it.
+    # Default: false
+    ignore-missing-subtests: true
+  revive:
+    rules:
+      - name: indent-error-flow
+      - name: unexported-return
+        disabled: true
+      - name: unused-parameter
+      - name: unused-receiver
