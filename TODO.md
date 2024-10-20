@@ -11,17 +11,17 @@
 - [x] Setup proper project structure according to [golang-standards/project-layout](https://github.com/golang-standards/project-layout)
 
 ## Features
+- [ ] Implement `changelog` command
 - [x] Implement `commit` command
   - [x] Analyze git diff
   - [x] Generate commit message using LLM
   - [x] Generate a summary per file to minimize token use
 - [ ] Implement `pr` command
-- [ ] Implement `changelog` command
-- [ ] Implement `bump` command
+- [ ] Implement `release-notes` command
+- [ ] Implement `version` command
   - [ ] Implement version bumping logic
   - [ ] Parse and update VERSION file
   - [ ] Implement semantic versioning rules
-- [ ] Implement `release-notes` command
 
 ## Configuration
 - [x] Add support for custom LLM model configuration
@@ -40,7 +40,7 @@
 ## Packaging and Distribution
 - [ ] Create PKGBUILD and Dockerfile
 - [ ] Set up Goreleaser configuration
-- [ ] Create golangci-lint workflow
+- [x] Create golangci-lint workflow
 - [ ] Create release workflow
 
 ## Testing
