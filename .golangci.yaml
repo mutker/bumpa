@@ -73,3 +73,21 @@ linters-settings:
         disabled: true
       - name: unused-parameter
       - name: unused-receiver
+
+output:
+  print-issued-lines: true
+  print-linter-name: true
+  uniq-by-line: true
+  show-stats: true
+  sort-results: true
+  sort-order:
+    - file
+    - linter
+    - severity
+
+issues:
+  max-issues-per-linter: 0
+  max-same-issues: 0
+  new: false
+  fix: true
+  whole-files: true
