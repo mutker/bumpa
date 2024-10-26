@@ -42,8 +42,8 @@ Available commands:
   - `commit`: Generate a commit message
   - `pr`: Generate a pull request description
   - `changelog`: Generate a changelog
-  - `bump`: Bump the application version
-  - `release-notes`: Generate release notes
+  - `version`: Bump the semantic version
+  - `release`: Generate release notes
 
 ### As a Git commit hook
 
