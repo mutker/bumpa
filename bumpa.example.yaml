@@ -4,26 +4,12 @@ logging:
   output: console
   level: debug
 
-# logging:
-#   environment: production
-#   timeformat: "TimeFormatUnix"
-#   output: file
-#   path: "/var/log/bumpa/bumpa.log"
-#   level: info
-
 llm:
-  provider: ollama
-  model: llama3.1
-  base_url: "http://localhost:11434"
-  api_key: "" # Ollama typically doesn't require an API key
-  max_retries: 3 # If commit message is not valid, try again
-
-# llm:
-#   provider: openai
-#   model: llama-3.1-70b-versatile
-#   base_url: https://api.groq.com/openai/v1
-#   api_key: gsk_xxx
-#   max_retries: 3 # If commit message is not valid, try again
+  provider: openai
+  model: llama3-groq-70b-8192-tool-use-preview
+  base_url: https://api.groq.com/openai/v1
+  api_key: gsk_xxx
+  max_retries: 3
 
 git:
   include_gitignore: true
@@ -31,23 +17,28 @@ git:
     - "go.mod"
     - "go.sum"
     - "*.log"
-    - "tmp/"
-    - "vendor/"
-
-templates:
-  commit_message: |
-    {{.Type}}{% if .Scope %}({{.Scope}}){% endif %}: {{.Description}}
-
-    {% if .Body %}{{.Body}}{% endif %}
-
-    {% if .Footer %}{{.Footer}}{% endif %}
+    - "TODO.md"
+  max_diff_lines: 10
 
 tools:
-  - name: generate_file_summary
+  - name: "analyze_file_changes"
     description: |
       Summarize the changes to a file in one short sentence.
       Focus on the key modifications, additions, or deletions, and ignore any changes such as added, removed, or sorted imports.
       NEVER provide improvements or ways to fix the code, only respond with a summary of the changes regardless of quality.
+    system_prompt: |
+      You are an expert code reviewer focusing on summarizing changes.
+      Provide your response as plain text without any JSON formatting or tool call syntax.
+      Focus on providing a clear, concise summary of the changes.
+    user_prompt: |
+      Analyze the following changes and provide a clear summary:
+      {{.Input}}
+
+      Remember to:
+      1. Focus on the meaningful changes
+      2. Be concise but descriptive
+      3. Respond in plain text only
+      4. Do not include any JSON or tool call formatting
     input_schema: |
       {
         "type": "object",
@@ -72,33 +63,31 @@ tools:
         "required": ["file", "status", "diff", "hasSignificantChanges"]
       }
 
-  - name: generate_conventional_commit
+  - name: "generate_commit_message"
     description: |
-      Generates a single, concise, and meaningful Git commit message that strictly adheres to the Conventional Commits 1.0.0 specification. This tool summarizes changes across multiple files into one commit message.
+      Generates a single, concise, and meaningful Git commit message that strictly adheres to the Conventional Commits 1.0.0 specification.
+    system_prompt: |
+      You are a commit message generator that follows Conventional Commits format.
+      Generate ONLY the commit message, no explanation or extra text.
+      Format: type(optional-scope): description
+      - type must be: feat, fix, docs, style, refactor, perf, test, chore, ci, build, revert
+      - scope is optional, lowercase, in parentheses
+      - description must be lowercase, no period at end
+      - must be under 72 characters
+    user_prompt: |
+      Previous attempt was invalid ({{.Error}}).
 
-      The commit message structure is as follows:
-      <type>[optional scope][!]: <description>
+      Branch: {{.Branch}}
 
-      [optional body]
+      Summary of changes:
+      {{.Summary}}
 
-      [optional footer(s)]
-
-      Key rules:
-      1. Commits MUST be prefixed with a type, which consists of feat, fix, or other allowed types.
-      2. A scope MAY be provided after a type, within parentheses.
-      3. A description MUST immediately follow the colon and space after the type/scope prefix.
-      4. A longer commit body MAY be provided after the short description.
-      5. A footer MAY be provided after the body, following the 'git trailer' convention.
-      6. Breaking changes MUST be indicated by a '!' before the ':' or as a 'BREAKING CHANGE:' footer.
-
-      Additional guidelines:
-      - Focus on the most significant modifications and their purpose, prioritizing changes to code structure, functionality, or behavior over minor changes like import reorganizations.
-      - If there are significant non-import changes, highlight those in the commit message.
-      - Avoid mentioning minor changes unless they are the only changes.
-      - Do not end the description with a period.
-      - Consider the current branch name when generating the commit message, especially if it's a feature or bugfix branch.
-
-      This tool helps maintain a standardized Git history, aiding in automated CHANGELOG generation and semantic versioning.
+      Remember:
+      1. ONLY output the commit message line
+      2. Follow format: type(scope): description
+      3. Type must be one of: feat, fix, docs, style, refactor, perf, test, chore, ci, build, revert
+      4. Description must be lowercase with no period
+      5. Must include colon and space after type/scope
     input_schema: |
       {
         "type": "object",
@@ -111,30 +100,13 @@ tools:
             "type": "string",
             "description": "The current git branch name"
           },
-          "type": {
+          "error": {
             "type": "string",
-            "enum": ["feat", "fix", "docs", "style", "refactor", "perf", "test", "build", "ci", "chore", "revert"],
-            "description": "The type of the commit"
+            "description": "Error from previous attempt, if any"
           },
-          "scope": {
+          "previous": {
             "type": "string",
-            "description": "Optional scope of the commit"
-          },
-          "is_breaking_change": {
-            "type": "boolean",
-            "description": "Indicates if this commit contains breaking changes"
-          },
-          "description": {
-            "type": "string",
-            "description": "A short description of the code changes"
-          },
-          "body": {
-            "type": "string",
-            "description": "Optional longer description of the changes"
-          },
-          "footer": {
-            "type": "string",
-            "description": "Optional footer (e.g., BREAKING CHANGE explanation)"
+            "description": "Previous attempt at generating a commit message"
           }
         },
         "required": ["summary", "branch"]

@@ -47,7 +47,6 @@ func run() error {
 
 	logger.Debug().
 		Str("command", cfg.Command).
-		Interface("config", cfg).
 		Msg("Configuration loaded")
 
 	ctx := context.Background()
@@ -121,7 +120,10 @@ func executeCommand(ctx context.Context, cfg *config.Config, llmClient llm.Clien
 func runCommit(ctx context.Context, cfg *config.Config, llmClient llm.Client, repo *git.Repository) error {
 	logger.Info().Msg("Starting commit process")
 
-	generator := commit.NewGenerator(cfg, llmClient, repo)
+	generator, err := commit.NewGenerator(cfg, llmClient, repo)
+	if err != nil {
+		return errors.Wrap(errors.CodeGitError, err)
+	}
 
 	message, err := generator.Generate(ctx)
 	if err != nil {

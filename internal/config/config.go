@@ -2,7 +2,9 @@ package config
 
 import (
 	"flag"
+	"fmt"
 	"os"
+	"strings"
 	"time"
 
 	"codeberg.org/mutker/bumpa/internal/errors"
@@ -54,9 +56,29 @@ type LLMConfig struct {
 }
 
 type Tool struct {
-	Name        string `mapstructure:"name" yaml:"name"`
-	Description string `mapstructure:"description" yaml:"description"`
-	InputSchema string `mapstructure:"input_schema" yaml:"input_schema"`
+	Name         string   `mapstructure:"name" yaml:"name"`
+	Type         string   `mapstructure:"type" yaml:"type"`
+	Function     Function `mapstructure:"function" yaml:"function"`
+	SystemPrompt string   `mapstructure:"system_prompt" yaml:"system_prompt"`
+	UserPrompt   string   `mapstructure:"user_prompt" yaml:"user_prompt"`
+}
+
+type Function struct {
+	Name        string     `mapstructure:"name" yaml:"name"`
+	Description string     `mapstructure:"description" yaml:"description"`
+	Parameters  Parameters `mapstructure:"parameters" yaml:"parameters"`
+}
+
+type Parameters struct {
+	Type       string              `mapstructure:"type" yaml:"type"`
+	Properties map[string]Property `mapstructure:"properties" yaml:"properties"`
+	Required   []string            `mapstructure:"required" yaml:"required"`
+}
+
+type Property struct {
+	Type        string   `mapstructure:"type" yaml:"type"`
+	Description string   `mapstructure:"description" yaml:"description"`
+	Enum        []string `mapstructure:"enum,omitempty" yaml:"enum,omitempty"`
 }
 
 //nolint:wrapcheck // Using WrapWithContext for configuration-specific error context
@@ -88,6 +110,24 @@ func Load() (*Config, error) {
 		)
 	}
 
+	// Add validation for tool prompts
+	for _, tool := range cfg.Tools {
+		if strings.TrimSpace(tool.SystemPrompt) == "" {
+			return nil, errors.WrapWithContext(
+				errors.CodeConfigError,
+				errors.ErrInvalidInput,
+				fmt.Sprintf("missing system prompt for tool: %s", tool.Name),
+			)
+		}
+		if strings.TrimSpace(tool.UserPrompt) == "" {
+			return nil, errors.WrapWithContext(
+				errors.CodeConfigError,
+				errors.ErrInvalidInput,
+				fmt.Sprintf("missing user prompt for tool: %s", tool.Name),
+			)
+		}
+	}
+
 	// Validate required tools exist
 	if !hasRequiredTools(cfg.Tools) {
 		return nil, errors.WrapWithContext(
@@ -106,7 +146,7 @@ func Load() (*Config, error) {
 
 func setDefaults() {
 	viper.SetDefault("llm.provider", "ollama")
-	viper.SetDefault("llm.model", "llama3.2:latest")
+	viper.SetDefault("llm.model", "llama3.1:latest")
 	viper.SetDefault("llm.base_url", "http://localhost:11434")
 	viper.SetDefault("llm.api_key", "")
 	viper.SetDefault("llm.max_retries", DefaultMaxRetries)

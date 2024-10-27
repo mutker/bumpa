@@ -22,13 +22,17 @@ type Generator struct {
 	tools []config.Tool
 }
 
-func NewGenerator(cfg *config.Config, llmClient llm.Client, repo *git.Repository) *Generator {
+func NewGenerator(cfg *config.Config, llmClient llm.Client, repo *git.Repository) (*Generator, error) {
+	if err := validateGeneratorConfig(cfg); err != nil {
+		return nil, err
+	}
+
 	return &Generator{
 		cfg:   cfg,
 		llm:   llmClient,
 		repo:  repo,
 		tools: cfg.Tools,
-	}
+	}, nil
 }
 
 func (g *Generator) Generate(ctx context.Context) (string, error) {
@@ -60,8 +64,63 @@ func (g *Generator) Generate(ctx context.Context) (string, error) {
 	return commitMessage, nil
 }
 
+func (g *Generator) getCurrentBranch() (string, error) {
+	head, err := g.repo.Head()
+	if err != nil {
+		return "", errors.Wrap(errors.CodeGitError, err)
+	}
+
+	if head.Name().IsBranch() {
+		return head.Name().Short(), nil
+	}
+
+	refs, err := g.repo.References()
+	if err != nil {
+		return "", errors.Wrap(errors.CodeGitError, err)
+	}
+
+	var closestBranch string
+	var closestCommit *object.Commit
+	err = refs.ForEach(func(ref *plumbing.Reference) error {
+		if ref.Name().IsBranch() {
+			commit, err := g.repo.CommitObject(ref.Hash())
+			if err != nil {
+				logger.Warn().Err(err).Str("ref", ref.Name().String()).Msg("Failed to get commit object for reference")
+				return nil
+			}
+			if closestCommit == nil || commit.Committer.When.After(closestCommit.Committer.When) {
+				closestBranch = ref.Name().Short()
+				closestCommit = commit
+			}
+		}
+
+		return nil
+	})
+	if err != nil {
+		return "", errors.Wrap(errors.CodeGitError, err)
+	}
+
+	if closestBranch == "" {
+		return "DETACHED_HEAD", nil
+	}
+
+	return closestBranch, nil
+}
+
 func (g *Generator) findTool(name string) *config.Tool {
-	return config.FindTool(g.tools, name)
+	tool := config.FindTool(g.tools, name)
+	if tool != nil {
+		logger.Debug().
+			Str("tool_name", name).
+			Str("system_prompt", tool.SystemPrompt).
+			Str("user_prompt", tool.UserPrompt).
+			Msg("Found tool configuration")
+	} else {
+		logger.Debug().
+			Str("tool_name", name).
+			Msg("Tool configuration not found")
+	}
+	return tool
 }
 
 func (g *Generator) shouldIgnoreFile(path string) bool {
@@ -122,7 +181,7 @@ func (g *Generator) generateFileSummary(ctx context.Context, path string, status
 		Interface("input", input).
 		Msg("Calling analyze_file_changes tool")
 
-	summary, err := llm.CallTool(ctx, g.llm, tool.Name, input)
+	summary, err := llm.CallTool(ctx, g.llm, tool, input)
 	if err != nil {
 		logger.Error().
 			Err(err).
@@ -189,14 +248,35 @@ func (g *Generator) generateCommitMessageFromSummary(ctx context.Context, summar
 		branchName = "unknown"
 	}
 
+	// Initial prompt with clear instructions
+	systemPrompt := `You are a commit message generator that follows Conventional Commits format.
+Generate ONLY the commit message, no explanation or extra text.
+Format: type(optional-scope): description
+- type must be: feat, fix, docs, style, refactor, perf, test, chore, ci, build, revert
+- scope is optional, lowercase, in parentheses
+- description must be lowercase, no period at end
+- must be under 72 characters`
+
 	input := map[string]interface{}{
 		"summary": summary,
 		"branch":  branchName,
+		"prompt":  systemPrompt,
+		"examples": []string{
+			"feat(parser): add ability to parse arrays",
+			"fix: handle edge case in sorting algorithm",
+			"refactor(auth): simplify login flow",
+			"docs: update readme installation steps",
+		},
 	}
 
-	tool := g.findTool("generate_conventional_commit")
+	tool := g.findTool("generate_commit_message")
 	if tool == nil {
-		return "", errors.New(errors.CodeConfigError)
+		logger.Error().Msg("generate_commit_message tool not found in configuration")
+		return "", errors.WrapWithContext(
+			errors.CodeConfigError,
+			errors.ErrInvalidInput,
+			"generate_commit_message tool not found",
+		)
 	}
 
 	maxRetries := g.cfg.LLM.MaxRetries
@@ -205,72 +285,167 @@ func (g *Generator) generateCommitMessageFromSummary(ctx context.Context, summar
 	}
 
 	for retries := 0; retries < maxRetries; retries++ {
-		message, err := llm.CallTool(ctx, g.llm, tool.Name, input)
+		logger.Debug().
+			Int("attempt", retries+1).
+			Int("maxRetries", maxRetries).
+			Msg("Attempting to generate commit message")
+
+		message, err := llm.CallTool(ctx, g.llm, tool, input)
 		if err != nil {
+			logger.Error().
+				Err(err).
+				Int("attempt", retries+1).
+				Msg("Failed to call LLM")
 			return "", errors.Wrap(errors.CodeLLMError, err)
 		}
 
-		logger.Debug().Str("generatedMessage", message).Msg("Received message from LLM")
+		logger.Debug().
+			Str("rawMessage", message).
+			Int("attempt", retries+1).
+			Msg("Received message from LLM")
 
-		message = strings.TrimSuffix(message, ".")
+		// Clean up the message
+		message = cleanCommitMessage(message)
+
+		logger.Debug().
+			Str("cleanedMessage", message).
+			Int("attempt", retries+1).
+			Msg("Cleaned message")
 
 		if isValidCommitMessage(message) {
+			logger.Info().
+				Str("message", message).
+				Int("attempts", retries+1).
+				Msg("Generated valid commit message")
 			return message, nil
 		}
 
 		if retries < maxRetries-1 {
-			input["summary"] = fmt.Sprintf("The previous response was invalid. "+
-				"Please generate a commit message in the Conventional Commits format. "+
-				"It should start with a type (feat, fix, refactor, etc.) followed by a colon and a short description. "+
-				"Do not end with a period. Consider the branch name '%s'. Here's the summary again:\n\n%s",
-				branchName, summary)
+			// Analyze why the message was invalid
+			invalidReason := analyzeInvalidMessage(message)
+
+			logger.Debug().
+				Str("message", message).
+				Str("reason", invalidReason).
+				Int("attempt", retries+1).
+				Msg("Invalid commit message")
+
+			// Update input with feedback for next attempt
+			input["error"] = invalidReason
+			input["previous"] = message
+			input["summary"] = fmt.Sprintf(`Previous attempt was invalid (%s).
+
+Branch: %s
+
+Summary of changes:
+%s
+
+Remember:
+1. ONLY output the commit message line
+2. Follow format: type(scope): description
+3. Type must be one of: feat, fix, docs, style, refactor, perf, test, chore, ci, build, revert
+4. Description must be lowercase with no period
+5. Must include colon and space after type/scope`, invalidReason, branchName, summary)
 		}
 	}
 
-	return "", errors.New(errors.CodeTimeoutError)
+	return "", errors.WrapWithContext(
+		errors.CodeTimeoutError,
+		errors.ErrInvalidInput,
+		fmt.Sprintf("failed to generate valid commit message after %d attempts", maxRetries),
+	)
 }
 
-func (g *Generator) getCurrentBranch() (string, error) {
-	head, err := g.repo.Head()
-	if err != nil {
-		return "", errors.Wrap(errors.CodeGitError, err)
+func cleanCommitMessage(message string) string {
+	// Remove any markdown formatting
+	message = strings.ReplaceAll(message, "`", "")
+	message = strings.ReplaceAll(message, "\"", "")
+
+	// Get first line only
+	if idx := strings.Index(message, "\n"); idx != -1 {
+		message = message[:idx]
 	}
 
-	if head.Name().IsBranch() {
-		return head.Name().Short(), nil
+	// Remove common prefixes LLMs might add
+	prefixes := []string{
+		"Here's a commit message:",
+		"Commit message:",
+		"Generated commit message:",
+		"The commit message is:",
+	}
+	for _, prefix := range prefixes {
+		message = strings.TrimPrefix(message, prefix)
 	}
 
-	refs, err := g.repo.References()
-	if err != nil {
-		return "", errors.Wrap(errors.CodeGitError, err)
+	// Clean up whitespace and periods
+	message = strings.TrimSpace(message)
+	message = strings.TrimSuffix(message, ".")
+
+	return message
+}
+
+func analyzeInvalidMessage(message string) string {
+	if message == "" {
+		return "empty message"
 	}
 
-	var closestBranch string
-	var closestCommit *object.Commit
-	err = refs.ForEach(func(ref *plumbing.Reference) error {
-		if ref.Name().IsBranch() {
-			commit, err := g.repo.CommitObject(ref.Hash())
-			if err != nil {
-				logger.Warn().Err(err).Str("ref", ref.Name().String()).Msg("Failed to get commit object for reference")
-				return nil
-			}
-			if closestCommit == nil || commit.Committer.When.After(closestCommit.Committer.When) {
-				closestBranch = ref.Name().Short()
-				closestCommit = commit
-			}
+	// Check for basic format issues
+	if !strings.Contains(message, ":") {
+		return "missing colon separator"
+	}
+
+	parts := strings.SplitN(message, ":", 2)
+	typeAndScope := parts[0]
+	description := ""
+	if len(parts) > 1 {
+		description = strings.TrimSpace(parts[1])
+	}
+
+	// Check type
+	validTypes := []string{"feat", "fix", "docs", "style", "refactor", "perf", "test", "chore", "ci", "build", "revert"}
+	hasValidType := false
+	for _, t := range validTypes {
+		if strings.HasPrefix(typeAndScope, t) {
+			hasValidType = true
+			break
 		}
-
-		return nil
-	})
-	if err != nil {
-		return "", errors.Wrap(errors.CodeGitError, err)
+	}
+	if !hasValidType {
+		return fmt.Sprintf("invalid type '%s'", typeAndScope)
 	}
 
-	if closestBranch == "" {
-		return "DETACHED_HEAD", nil
+	// Check scope format if present
+	if strings.Contains(typeAndScope, "(") {
+		if !strings.HasSuffix(typeAndScope, ")") {
+			return "malformed scope - missing closing parenthesis"
+		}
+		scope := strings.TrimSuffix(strings.TrimPrefix(
+			typeAndScope[strings.Index(typeAndScope, "("):],
+			"(",
+		), ")")
+		if scope == "" {
+			return "empty scope"
+		}
+		if strings.ContainsAny(scope, "ABCDEFGHIJKLMNOPQRSTUVWXYZ") {
+			return "scope must be lowercase"
+		}
 	}
 
-	return closestBranch, nil
+	// Check description
+	if description == "" {
+		return "missing description"
+	}
+	if !strings.HasPrefix(description, " ") || strings.HasPrefix(description, "  ") {
+		return "must have exactly one space after colon"
+	}
+	if strings.HasSuffix(description, ".") {
+		return "description ends with period"
+	}
+	if strings.ToLower(description) != description {
+		return "description must be lowercase"
+	}
+
+	return "unknown validation error"
 }
 
 func (*Generator) filterImportChanges(diff string) (string, bool) {
@@ -305,5 +480,100 @@ func (*Generator) filterImportChanges(diff string) (string, bool) {
 func isValidCommitMessage(message string) bool {
 	pattern := `^(feat|fix|docs|style|refactor|perf|test|chore|ci|build|revert)(\([a-z-]+\))?: [a-z].*[^.]$`
 	matched, _ := regexp.MatchString(pattern, strings.Split(message, "\n")[0])
+
+	// Add debug logging
+	logger.Debug().
+		Str("message", message).
+		Bool("matched", matched).
+		Str("pattern", pattern).
+		Msg("Validating commit message")
+
 	return matched
+}
+
+func validateGeneratorConfig(cfg *config.Config) error {
+	if cfg == nil {
+		return errors.WrapWithContext(
+			errors.CodeConfigError,
+			errors.ErrInvalidInput,
+			"configuration is required",
+		)
+	}
+	if len(cfg.Tools) == 0 {
+		return errors.WrapWithContext(
+			errors.CodeConfigError,
+			errors.ErrInvalidInput,
+			"missing required tools configuration",
+		)
+	}
+
+	requiredTools := []string{"analyze_file_changes", "generate_commit_message"}
+	for _, tool := range requiredTools {
+		if !hasToolConfig(cfg.Tools, tool) {
+			return errors.WrapWithContext(
+				errors.CodeConfigError,
+				errors.ErrInvalidInput,
+				fmt.Sprintf("missing required tool: %s", tool),
+			)
+		}
+	}
+	return nil
+}
+
+func hasToolConfig(tools []config.Tool, name string) bool {
+	for _, tool := range tools {
+		if tool.Name == name {
+			return true
+		}
+	}
+	return false
+}
+
+func validateCommitMessage(message string) (bool, string) {
+	if message == "" {
+		return false, "empty message"
+	}
+
+	pattern := `^(feat|fix|docs|style|refactor|perf|test|chore|ci|build|revert)(\([a-z-]+\))?: [a-z].*[^.]$`
+	matched, _ := regexp.MatchString(pattern, strings.Split(message, "\n")[0])
+
+	if !matched {
+		return false, analyzeCommitMessageError(message)
+	}
+
+	return true, ""
+}
+
+func analyzeCommitMessageError(message string) string {
+	if !strings.Contains(message, ":") {
+		return "missing colon separator"
+	}
+
+	parts := strings.SplitN(message, ":", 2)
+	if len(parts) != 2 {
+		return "invalid format"
+	}
+
+	typeAndScope := parts[0]
+	description := strings.TrimSpace(parts[1])
+
+	validTypes := []string{"feat", "fix", "docs", "style", "refactor", "perf", "test", "chore", "ci", "build", "revert"}
+	if !containsAny(typeAndScope, validTypes) {
+		return "invalid type"
+	}
+
+	if description == "" {
+		return "missing description"
+	}
+
+	return "format error"
+}
+
+func containsAny(s string, substrs []string) bool {
+	for _, sub := range substrs {
+		if strings.HasPrefix(s, sub) {
+			return true
+		}
+	}
+	return false
 }

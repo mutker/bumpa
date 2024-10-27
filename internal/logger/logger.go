@@ -107,6 +107,10 @@ func Debug() *zerolog.Event {
 	return logger.Debug()
 }
 
+func DebugWithComponent(component string) *zerolog.Event {
+	return logger.Debug().Str("component", component)
+}
+
 // Info logs an info message
 func Info() *zerolog.Event {
 	return logger.Info()

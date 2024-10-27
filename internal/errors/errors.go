@@ -19,7 +19,8 @@ const (
 	CodeGitError = "git_error"
 
 	// LLM errors
-	CodeLLMError = "llm_error"
+	CodeLLMError      = "llm_error"
+	CodeTemplateError = "template_error"
 
 	// Input/validation errors
 	CodeInputError   = "input_error"
@@ -28,14 +29,15 @@ const (
 
 // Consolidated error messages
 var errorMessages = map[string]string{
-	CodeInitFailed:   "initialization failed",
-	CodeConfigError:  "configuration error",
-	CodeRuntimeError: "runtime error occurred",
-	CodeTimeoutError: "operation timed out",
-	CodeGitError:     "git operation failed",
-	CodeLLMError:     "LLM operation failed",
-	CodeInputError:   "invalid input",
-	CodeInvalidState: "invalid state",
+	CodeInitFailed:    "initialization failed",
+	CodeConfigError:   "configuration error",
+	CodeRuntimeError:  "runtime error occurred",
+	CodeTimeoutError:  "operation timed out",
+	CodeGitError:      "git operation failed",
+	CodeLLMError:      "LLM operation failed",
+	CodeTemplateError: "Template operation failed",
+	CodeInputError:    "invalid input",
+	CodeInvalidState:  "invalid state",
 }
 
 // Common errors
