@@ -39,11 +39,13 @@ const (
 )
 
 func OpenRepository(path string, cfg config.GitConfig) (*Repository, error) {
-	logger.Debug().Str("path", path).Msg("Opening git repository")
 	repo, err := gogit.PlainOpen(path)
 	if err != nil {
-		logger.Error().Err(err).Str("path", path).Msg("Failed to open git repository")
-		return nil, errors.Wrap(errors.CodeGitError, err)
+		return nil, errors.WrapWithContext(
+			errors.CodeGitError,
+			err,
+			"failed to open repository",
+		)
 	}
 
 	return &Repository{repo: repo, cfg: cfg}, nil
@@ -120,20 +122,26 @@ func (r *Repository) GetCurrentBranch() (string, error) {
 	return closestBranch, nil
 }
 
-//nolint:cyclop // Complex git diff logic requires multiple error checks
+//nolint:cyclop // Complex function handling multiple git operations
 func (r *Repository) GetFileDiff(path string) (string, error) {
-	// Get worktree and status
 	w, err := r.repo.Worktree()
 	if err != nil {
-		return "", errors.Wrap(errors.CodeGitError, err)
+		return "", errors.WrapWithContext(
+			errors.CodeGitError,
+			err,
+			"failed to get worktree",
+		)
 	}
 
 	status, err := w.Status()
 	if err != nil {
-		return "", errors.Wrap(errors.CodeGitError, err)
+		return "", errors.WrapWithContext(
+			errors.CodeGitError,
+			err,
+			"failed to get status",
+		)
 	}
 
-	// Check special statuses
 	fileStatus := status.File(path)
 	if fileStatus.Staging == Untracked {
 		return newFileMessage, nil

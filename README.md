@@ -77,7 +77,7 @@ Integrate bumpa into your CI/CD pipeline by adding it to your workflow configura
   run: bumpa changelog
 
 - name: Bump Version
-  run: bumpa bump
+  run: bumpa version
 
 - name: Generate Release Notes
   run: bumpa release-notes
@@ -85,40 +85,50 @@ Integrate bumpa into your CI/CD pipeline by adding it to your workflow configura
 
 ## Configuration
 
-Rename the `bumpa.example.yaml` file to `.bumpa.yaml` and put it in your project root. Adjust accordingly:
+Rename the `bumpa.example.yaml` file to `.bumpa.yaml` and put it in your project root.
 
 ```yaml
+logging:
+  environment: development
+  timeformat: "RFC3339"
+  output: console
+  level: debug
+
 llm:
-  provider: "ollama"  # or "openai" for any OpenAI API-comptaible provider
-  model: "llama3.1:8b-instruct-q8_0"  # or e.g. "gpt-4o" for OpenAI
-  api_key: "your-api-key-if-needed"
+  provider: openai # or ollama
+  model: llama3-groq-70b-8192-tool-use-preview
+  base_url: https://api.groq.com/openai/v1
+  api_key: gsk_xxx
+  max_retries: 3
+  request_timeout: 30s
+  commit_msg_timeout: 30s
 
-  logging:
-    environment: "development"
-    timeformat: "RFC3339"
-    output: "console"
-    level: "info"
+git:
+  include_gitignore: true
+  ignore:
+    - "go.mod"
+    - "go.sum"
+    - "*.log"
+    - "TODO.md"
+  max_diff_lines: 10
+  preferred_line_length: 72 # Standard git commit message length
 
-  git:
-    include_gitignore: false
-    ignore:
-      - ".bumpa.yaml"
-      - "*.log"
-      - "*.tmp"
+# Function calls/tools for commit message generation
+tools:
+  - name: "generate_file_summary"
+    system_prompt: ...
+    user_prompt: ...
 
-  prompts:
-    diff_summary:
-      system: "Your system prompt for diff summary"
-      user: "Your user prompt for diff summary"
-    commit_message:
-      system: "Your system prompt for commit message"
-      user: "Your user prompt for commit message"
-    file_summary:
-      system: "Your system prompt for file summary"
-      user: "Your user prompt for file summary"
+  - name: "generate_commit_message"
+    system_prompt: ...
+    user_prompt: ...
+
+  - name: "retry_commit_message"
+    system_prompt: ...
+    user_prompt: ...
 ```
 
-Prompts are included in `bumpa.example.yaml`, but feel free to modify. Please create an issue or make a PR if you find a particular effective prompt and/or model!
+Prompts for function calls (tool use) are included in `bumpa.example.yaml`, but feel free to modify. Please create an issue or make a PR if you find a particular effective prompt and/or model!
 
 ## Templates
 
@@ -142,5 +152,5 @@ Contributions are welcome! Please feel free to submit a issue or pull request.
 
 ## License
 
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+This project is licensed under the MIT License. See the [LICENSE](LICENSE) file for details.
 ```

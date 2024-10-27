@@ -4,106 +4,117 @@ import (
 	"errors"
 	"fmt"
 	"strings"
-
-	"github.com/spf13/viper"
 )
 
+// Use standard errors.Is and errors.As directly
+var (
+	Is = errors.Is
+	As = errors.As
+)
+
+// Error codes
 const (
 	// System errors
-	CodeInitFailed   = "init_failed"
-	CodeConfigError  = "config_error"
-	CodeRuntimeError = "runtime_error"
-	CodeTimeoutError = "timeout_error"
+	CodeUnknown       = "unknown_error"  // Unknown error
+	CodeInitFailed    = "init_failed"    // Initialization failures
+	CodeConfigError   = "config_error"   // Configuration issues
+	CodeRuntimeError  = "runtime_error"  // General runtime errors
+	CodeTimeoutError  = "timeout_error"  // Timeout related errors
+	CodeValidateError = "validate_error" // Validation failures
 
-	// Git errors
-	CodeGitError = "git_error"
-
-	// LLM errors
-	CodeLLMError = "llm_error"
-
-	// Input/validation errors
-	CodeInputError   = "input_error"
-	CodeInvalidState = "invalid_state"
+	// Domain errors
+	CodeGitError      = "git_error"      // Git operation failures
+	CodeLLMError      = "llm_error"      // LLM related errors
+	CodeInputError    = "input_error"    // User input errors
+	CodeTemplateError = "template_error" // Template processing errors
+	CodeInvalidState  = "invalid_state"  // Invalid application state
 )
 
-// Consolidated error messages
+// Standard error messages
 var errorMessages = map[string]string{
-	CodeInitFailed:   "initialization failed",
-	CodeConfigError:  "configuration error",
-	CodeRuntimeError: "runtime error occurred",
-	CodeTimeoutError: "operation timed out",
-	CodeGitError:     "git operation failed",
-	CodeLLMError:     "LLM operation failed",
-	CodeInputError:   "invalid input",
-	CodeInvalidState: "invalid state",
+	CodeUnknown:       "unknown error",
+	CodeInitFailed:    "initialization failed",
+	CodeConfigError:   "configuration error",
+	CodeRuntimeError:  "runtime error occurred",
+	CodeTimeoutError:  "operation timed out",
+	CodeValidateError: "validation failed",
+	CodeGitError:      "git operation failed",
+	CodeLLMError:      "LLM operation failed",
+	CodeInputError:    "invalid input provided",
+	CodeTemplateError: "template processing failed",
+	CodeInvalidState:  "invalid application state",
 }
 
 // Common errors
 var (
-	ErrNotFound     = errors.New("not found")
-	ErrInvalidInput = errors.New("invalid input")
-	ErrUnauthorized = errors.New("unauthorized")
-	ErrInternal     = errors.New("internal error")
+	ErrNotFound      = errors.New("not found")
+	ErrInvalidInput  = errors.New("invalid input")
+	ErrUnauthorized  = errors.New("unauthorized")
+	ErrInternal      = errors.New("internal error")
+	ErrLLMStatus     = errors.New("llm status error")
+	ErrInvalidConfig = errors.New("invalid configuration")
+	ErrTimeout       = errors.New("timeout")
 )
 
 // New creates an error with a code
 func New(code string) error {
-	if msg, ok := errorMessages[code]; ok {
-		return fmt.Errorf("%s: %s", code, msg) //nolint:err113 // Dynamic error messages required for error code system
-	}
-
-	return fmt.Errorf("unknown error: %s", code) //nolint:err113 // Dynamic error messages required for error code system
+	return fmt.Errorf("%s: %s", code, errorMessages[code]) //nolint:err113 // Custom error formatting for consistent error messages
 }
 
-// Wrap wraps an error with a code
+// Wrap wraps an error with a code and uses standard message
 func Wrap(code string, err error) error {
 	if err == nil {
 		return nil
 	}
 	msg := errorMessages[code]
 	if msg == "" {
-		return fmt.Errorf("%s: %w", code, err)
+		msg = CodeUnknown
 	}
-
 	return fmt.Errorf("%s: %s: %w", code, msg, err)
 }
 
-// WrapWithContext wraps an error with code and context
+// WrapWithContext wraps an error with code and custom context
 func WrapWithContext(code string, err error, context string) error {
 	if err == nil {
 		return nil
 	}
 	msg := errorMessages[code]
 	if msg == "" {
-		return fmt.Errorf("%s: %s: %w", code, context, err)
+		msg = "unknown error"
 	}
-
 	return fmt.Errorf("%s: %s: %s: %w", code, msg, context, err)
 }
 
-// Is checks if an error matches a code or error
-func Is(err error, target interface{}) bool {
-	switch t := target.(type) {
-	case error:
-		return errors.Is(err, t)
-	case string:
-		return strings.Contains(err.Error(), t+":")
-	default:
-		return false
+// GetMessage returns the standard message for an error code
+func GetMessage(code string) string {
+	if msg, ok := errorMessages[code]; ok {
+		return msg
 	}
+	return CodeUnknown
 }
 
-// IsConfigFileNotFound checks for config file not found
-func IsConfigFileNotFound(err error) bool {
-	var configFileNotFound viper.ConfigFileNotFoundError
-	return errors.As(err, &configFileNotFound)
+// GetCode extracts the error code from an error
+func GetCode(err error) string {
+	if err == nil {
+		return ""
+	}
+	parts := strings.SplitN(err.Error(), ":", 2) //nolint:mnd // Split into type+scope and description
+	return parts[0]
 }
 
-// ErrorMessage gets message for code
+// ErrorMessage returns the standard message for an error code
 func ErrorMessage(code string) string {
 	if msg, ok := errorMessages[code]; ok {
 		return msg
 	}
+	return CodeUnknown
+}
 
-	return code
+// IsConfigFileNotFound checks if the error is a config file not found error
+func IsConfigFileNotFound(err error) bool {
+	if err == nil {
+		return false
+	}
+	return strings.Contains(err.Error(), "Config File") &&
+		strings.Contains(err.Error(), "Not Found")
 }

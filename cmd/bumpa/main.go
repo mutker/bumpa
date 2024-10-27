@@ -20,6 +20,7 @@ import (
 const (
 	commitCommand = "commit"
 	editCommand   = "edit"
+	retryCommand  = "retry"
 	quitCommand   = "quit"
 )
 
@@ -30,7 +31,7 @@ type UserAction struct {
 
 func main() {
 	if err := run(); err != nil {
-		logger.Error().Err(err).Msg(errors.ErrorMessage(errors.CodeRuntimeError))
+		logger.Error().Err(err).Msg(errors.GetMessage(errors.CodeRuntimeError))
 		os.Exit(1)
 	}
 }
@@ -45,9 +46,13 @@ func run() error {
 		return err
 	}
 
+	logger.Debug().
+		Str("command", cfg.Command).
+		Msg("Configuration loaded")
+
 	ctx := context.Background()
 
-	llmClient, err := initializeLLMClient(ctx, cfg)
+	llmClient, err := initializeLLMClient(cfg)
 	if err != nil {
 		return err
 	}
@@ -57,7 +62,11 @@ func run() error {
 		return err
 	}
 
-	return executeCommand(ctx, cfg, llmClient, repo)
+	if err := executeCommand(ctx, cfg, llmClient, repo); err != nil {
+		return errors.Wrap(errors.CodeRuntimeError, err)
+	}
+
+	return nil
 }
 
 func initializeLogger() error {
@@ -79,8 +88,8 @@ func loadConfig() (*config.Config, error) {
 }
 
 //nolint:ireturn // Interface return needed for flexibility and testing
-func initializeLLMClient(ctx context.Context, cfg *config.Config) (llm.Client, error) {
-	llmClient, err := llm.New(ctx, &cfg.LLM)
+func initializeLLMClient(cfg *config.Config) (llm.Client, error) {
+	llmClient, err := llm.New(&cfg.LLM)
 	if err != nil {
 		return nil, errors.Wrap(errors.CodeLLMError, err)
 	}
@@ -97,34 +106,31 @@ func openGitRepository(cfg *config.Config) (*git.Repository, error) {
 	return repo, nil
 }
 
-//nolint:wrapcheck // Using WrapWithContext for command-specific error context
 func executeCommand(ctx context.Context, cfg *config.Config, llmClient llm.Client, repo *git.Repository) error {
 	switch cfg.Command {
 	case "commit":
 		return runCommit(ctx, cfg, llmClient, repo)
 	case "version", "changelog", "pr", "release":
-		return errors.New(errors.CodeInputError)
+		return errors.WrapWithContext(
+			errors.CodeInputError,
+			errors.ErrInvalidInput,
+			"command not yet implemented",
+		)
 	default:
 		return errors.WrapWithContext(
 			errors.CodeInputError,
 			errors.ErrInvalidInput,
-			"unknown command: "+cfg.Command,
+			fmt.Sprintf("unknown command: %s", cfg.Command), //nolint:perfsprint // More readable than concatenation
 		)
 	}
 }
 
+//nolint:cyclop // Complex function handling git commit workflow
 func runCommit(ctx context.Context, cfg *config.Config, llmClient llm.Client, repo *git.Repository) error {
 	logger.Info().Msg("Starting commit process")
 
-	generator := commit.NewGenerator(cfg, llmClient, repo)
-
-	message, err := generator.Generate(ctx)
+	generator, err := commit.NewGenerator(cfg, llmClient, repo)
 	if err != nil {
-		if errors.Is(err, errors.CodeInvalidState) {
-			logger.Info().Msg(errors.ErrorMessage(errors.CodeInvalidState))
-			return nil
-		}
-
 		return errors.Wrap(errors.CodeGitError, err)
 	}
 
@@ -133,40 +139,56 @@ func runCommit(ctx context.Context, cfg *config.Config, llmClient llm.Client, re
 		return errors.Wrap(errors.CodeGitError, err)
 	}
 
-	userAction, err := promptUserAction(message, filesToCommit)
-	if err != nil {
-		return errors.Wrap(errors.CodeInputError, err)
-	}
-
-	switch userAction.Command {
-	case commitCommand:
-		if err := repo.MakeCommit(ctx, userAction.Message, filesToCommit); err != nil {
+	for {
+		message, err := generator.Generate(ctx)
+		if err != nil {
+			if errors.Is(err, errors.ErrInvalidInput) {
+				logger.Info().Msg(errors.GetMessage(errors.CodeInvalidState))
+				return nil
+			}
 			return errors.Wrap(errors.CodeGitError, err)
 		}
-		logger.Info().Msg("Commit successfully created")
-	case editCommand:
-		if err := repo.MakeCommit(ctx, userAction.Message, filesToCommit); err != nil {
-			return errors.Wrap(errors.CodeGitError, err)
+
+		userAction, err := promptUserAction(message, filesToCommit)
+		if err != nil {
+			return errors.Wrap(errors.CodeInputError, err)
 		}
-		logger.Info().Msg("Commit successfully created with edited message")
-	case quitCommand:
-		logger.Info().Msg("Commit aborted")
+
+		switch userAction.Command {
+		case commitCommand:
+			if err := repo.MakeCommit(ctx, userAction.Message, filesToCommit); err != nil {
+				return errors.Wrap(errors.CodeGitError, err)
+			}
+			logger.Info().Msg("Commit successfully created")
+			return nil
+		case editCommand:
+			if err := repo.MakeCommit(ctx, userAction.Message, filesToCommit); err != nil {
+				return errors.Wrap(errors.CodeGitError, err)
+			}
+			logger.Info().Msg("Commit successfully created with edited message")
+			return nil
+		case retryCommand:
+			logger.Info().Msg("Retrying commit message generation")
+			continue // Simply loop and generate again
+		case quitCommand:
+			logger.Info().Msg("Commit aborted")
+			return nil
+		}
 	}
-
-	logger.Info().Msg("Commit process completed successfully")
-
-	return nil
 }
 
 func promptUserAction(message string, files []string) (UserAction, error) {
 	fileList := strings.Join(files, "\n  ")
 	prompt := formatPrompt(fileList, message)
+
 	response, err := getUserResponse(prompt)
 	if err != nil {
 		return UserAction{Command: quitCommand}, errors.Wrap(errors.CodeInputError, err)
 	}
 
-	return processUserResponse(response, message)
+	action := processUserResponse(response, message)
+
+	return action, nil
 }
 
 func editCommitMessage(message string) string {
@@ -209,7 +231,7 @@ func editCommitMessage(message string) string {
 
 func formatPrompt(fileList, message string) string {
 	return fmt.Sprintf("Files to commit:\n  %s\n\nCommit message:\n  %s\n\n"+
-		"Do you want to (c)ommit, (e)dit, or (Q)uit? (c/e/Q) ", fileList, message)
+		"Do you want to (c)ommit, (e)dit, (r)etry, or (Q)uit? (c/e/r/Q) ", fileList, message)
 }
 
 //nolint:forbidigo // Direct console interaction required
@@ -224,15 +246,17 @@ func getUserResponse(prompt string) (string, error) {
 	return strings.TrimSpace(strings.ToLower(response)), nil
 }
 
-func processUserResponse(response, originalMessage string) (UserAction, error) {
+func processUserResponse(response, originalMessage string) UserAction {
 	logger.Debug().Str("response", response).Msg("User response")
 	switch response {
 	case "c":
-		return UserAction{Command: commitCommand, Message: originalMessage}, nil
+		return UserAction{Command: commitCommand, Message: originalMessage}
 	case "e":
 		editedMessage := editCommitMessage(originalMessage)
-		return UserAction{Command: editCommand, Message: editedMessage}, nil
+		return UserAction{Command: editCommand, Message: editedMessage}
+	case "r":
+		return UserAction{Command: retryCommand, Message: ""}
 	default:
-		return UserAction{Command: quitCommand, Message: ""}, nil
+		return UserAction{Command: quitCommand, Message: ""}
 	}
 }

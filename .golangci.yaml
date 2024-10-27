@@ -11,7 +11,9 @@ linters:
     - gci # https://github.com/golangci/golangci-lint/issues/1490
     - godot
     - gomnd
+    - nlreturn
     - varnamelen
+    - wrapcheck
     - wsl
     - zerologlint
 

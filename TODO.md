@@ -9,8 +9,8 @@
   - [x] Set up Ollama client
   - [x] Set up OpenAI client
 - [x] Setup proper project structure according to [golang-standards/project-layout](https://github.com/golang-standards/project-layout)
-- [ ] Implement logger and error management
-- [ ] Fix all linting errors
+- [x] Implement logger and error management
+- [x] Fix all linting errors
 
 ## Features
 - [ ] Implement `changelog` command

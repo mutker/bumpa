@@ -4,26 +4,14 @@ logging:
   output: console
   level: debug
 
-# logging:
-#   environment: production
-#   timeformat: "TimeFormatUnix"
-#   output: file
-#   path: "/var/log/bumpa/bumpa.log"
-#   level: info
-
 llm:
-  provider: ollama
-  model: llama3.1
-  base_url: "http://localhost:11434"
-  api_key: "" # Ollama typically doesn't require an API key
-  max_retries: 3 # If commit message is not valid, try again
-
-# llm:
-#   provider: openai
-#   model: llama-3.1-70b-versatile
-#   base_url: https://api.groq.com/openai/v1
-#   api_key: gsk_xxx
-#   max_retries: 3 # If commit message is not valid, try again
+  provider: openai-compatible
+  model: llama3.1:latest
+  base_url: http://localhost:11434/v1
+  # api_key: optional, only needed for some providers like OpenAI or Groq
+  max_retries: 3
+  request_timeout: 30s
+  commit_msg_timeout: 30s
 
 git:
   include_gitignore: true
@@ -31,111 +19,162 @@ git:
     - "go.mod"
     - "go.sum"
     - "*.log"
-    - "tmp/"
-    - "vendor/"
-
-templates:
-  commit_message: |
-    {{.Type}}{% if .Scope %}({{.Scope}}){% endif %}: {{.Description}}
-
-    {% if .Body %}{{.Body}}{% endif %}
-
-    {% if .Footer %}{{.Footer}}{% endif %}
+    - "TODO.md"
+  max_diff_lines: 10
+  preferred_line_length: 72 # Standard git commit message length
 
 tools:
-  - name: generate_file_summary
-    description: |
-      Summarize the changes to a file in one short sentence.
-      Focus on the key modifications, additions, or deletions, and ignore any changes such as added, removed, or sorted imports.
-      NEVER provide improvements or ways to fix the code, only respond with a summary of the changes regardless of quality.
-    input_schema: |
-      {
-        "type": "object",
-        "properties": {
-          "file": {
-            "type": "string",
-            "description": "The path of the file"
-          },
-          "status": {
-            "type": "string",
-            "description": "The status of the file (Added, Modified, Deleted, Untracked, or Changed)"
-          },
-          "diff": {
-            "type": "string",
-            "description": "The diff of the file changes"
-          },
-          "hasSignificantChanges": {
-            "type": "boolean",
-            "description": "Indicates if there are significant changes beyond import modifications"
-          }
-        },
-        "required": ["file", "status", "diff", "hasSignificantChanges"]
-      }
+  - name: "generate_file_summary"
+    type: "function"
+    function:
+      name: "generate_file_summary"
+      description: "Analyze git file changes and provide a concise summary"
+      parameters:
+        type: "object"
+        properties:
+          file:
+            type: "string"
+            description: "The path of the file"
+          status:
+            type: "string"
+            description: "The git status of the file"
+            enum: ["A", "M", "D", "R", "C"] # Standard git status codes
+          diff:
+            type: "string"
+            description: "The git diff content"
+          hasSignificantChanges:
+            type: "boolean"
+            description: "Whether there are significant non-import changes"
+        required: ["file", "status", "diff", "hasSignificantChanges"]
+    system_prompt: |
+      You are a code review assistant specializing in summarizing Git changes.
+      Your task is to analyze changes and provide clear, informative summaries.
 
-  - name: generate_conventional_commit
-    description: |
-      Generates a single, concise, and meaningful Git commit message that strictly adheres to the Conventional Commits 1.0.0 specification. This tool summarizes changes across multiple files into one commit message.
+      Rules:
+      1. Provide a clear, concise, single-sentence summary
+      2. Focus on what changed, not how or why
+      3. For significant changes, describe the main functionality change
+      4. For minor changes, use phrases like "minor improvements" or "formatting updates"
+      5. Never suggest improvements or alternatives
+      6. Keep summaries factual and objective
 
-      The commit message structure is as follows:
-      <type>[optional scope][!]: <description>
+      Examples:
+      - "Add user authentication middleware with JWT support"
+      - "Update logging format to include trace IDs"
+      - "Minor formatting improvements and comment updates"
+    user_prompt: |
+      Provide a concise summary of the following file changes:
+      File: {{.file}}
+      Status: {{.status}}
+      Changes:
+      {{.diff}}
 
-      [optional body]
+  - name: "generate_commit_message"
+    type: "function"
+    function:
+      name: "generate_commit_message"
+      description: "Generate a conventional commit message"
+      parameters:
+        type: "object"
+        properties:
+          summary:
+            type: "string"
+            description: "Summary of all file changes"
+          branch:
+            type: "string"
+            description: "The current git branch name"
+        required: ["summary", "branch"]
+    system_prompt: |
+      You are a Conventional Commits expert. Generate a commit message following these exact rules:
 
-      [optional footer(s)]
+      Header format (MUST BE): type(scope): description
+      Example: fix(errors): improve error handling and validation
 
-      Key rules:
-      1. Commits MUST be prefixed with a type, which consists of feat, fix, or other allowed types.
-      2. A scope MAY be provided after a type, within parentheses.
-      3. A description MUST immediately follow the colon and space after the type/scope prefix.
-      4. A longer commit body MAY be provided after the short description.
-      5. A footer MAY be provided after the body, following the 'git trailer' convention.
-      6. Breaking changes MUST be indicated by a '!' before the ':' or as a 'BREAKING CHANGE:' footer.
+      Rules:
+      1. Type MUST be one of:
+         feat|fix|docs|style|refactor|perf|test|chore|ci|build
+      2. Scope MUST be:
+         - In parentheses
+         - Lowercase
+         - Single word or hyphenated
+         - Related to the primary component being changed
+      3. Description MUST be:
+         - Separated from type(scope) by ": " (colon and single space)
+         - Lowercase
+         - No period at end
+         - Under 72 chars total
+         - Use imperative: "add" not "added"
+         - Clear and concise
 
-      Additional guidelines:
-      - Focus on the most significant modifications and their purpose, prioritizing changes to code structure, functionality, or behavior over minor changes like import reorganizations.
-      - If there are significant non-import changes, highlight those in the commit message.
-      - Avoid mentioning minor changes unless they are the only changes.
-      - Do not end the description with a period.
-      - Consider the current branch name when generating the commit message, especially if it's a feature or bugfix branch.
+      For multiple file changes:
+      1. Header summarizes primary change
+      2. Add body after two newlines
+      3. Group related changes in body
+      4. Example:
+         fix(config): improve error handling and validation
 
-      This tool helps maintain a standardized Git history, aiding in automated CHANGELOG generation and semantic versioning.
-    input_schema: |
-      {
-        "type": "object",
-        "properties": {
-          "summary": {
-            "type": "string",
-            "description": "A summary of all file changes"
-          },
-          "branch": {
-            "type": "string",
-            "description": "The current git branch name"
-          },
-          "type": {
-            "type": "string",
-            "enum": ["feat", "fix", "docs", "style", "refactor", "perf", "test", "build", "ci", "chore", "revert"],
-            "description": "The type of the commit"
-          },
-          "scope": {
-            "type": "string",
-            "description": "Optional scope of the commit"
-          },
-          "is_breaking_change": {
-            "type": "boolean",
-            "description": "Indicates if this commit contains breaking changes"
-          },
-          "description": {
-            "type": "string",
-            "description": "A short description of the code changes"
-          },
-          "body": {
-            "type": "string",
-            "description": "Optional longer description of the changes"
-          },
-          "footer": {
-            "type": "string",
-            "description": "Optional footer (e.g., BREAKING CHANGE explanation)"
-          }
-        },
-        "required": ["summary", "branch"]
-      }
+         * config: add validation for required fields
+         * errors: centralize error definitions
+         * logger: improve error context logging
+
+         Additional updates:
+         * Update linter configuration
+         * Fix formatting in various files
+    user_prompt: |
+      Generate a commit message following the exact format above:
+      Branch: {{.branch}}
+
+      Changes:
+      {{.summary}}
+
+  - name: "retry_commit_message"
+    type: "function"
+    function:
+      name: "retry_commit_message"
+      description: "Generate a commit message, learning from previous invalid attempt"
+      parameters:
+        type: "object"
+        properties:
+          summary:
+            type: "string"
+            description: "Summary of all file changes"
+          branch:
+            type: "string"
+            description: "The current git branch name"
+          previous:
+            type: "string"
+            description: "The previous invalid commit message"
+          error:
+            type: "string"
+            description: "The reason the previous attempt was invalid"
+        required: ["summary", "branch", "previous", "error"]
+    system_prompt: |
+      You are a Conventional Commits expert. Previous attempt failed: {{.error}}
+
+      CRITICAL RULES:
+      1. TOTAL header length MUST be under 72 chars
+      2. Format MUST be: type(scope): description
+         - Exactly ONE space after colon
+         - No space before colon
+      3. Type MUST be one of: feat|fix|docs|style|refactor|perf|test|chore|ci|build
+      4. Scope MUST be single word, lowercase component name
+      5. Description MUST be under 40 chars
+
+      Character count examples:
+      refactor(llm): update message structure     # 39 chars ✓
+      fix(errors): improve handling patterns      # 41 chars ✓
+      style(config): reorganize fields           # 35 chars ✓
+
+      Previous attempts (invalid):
+      {{.previous}}                              # Too long/wrong format
+
+      Focus on MOST IMPORTANT change only!
+      - Use shortest clear scope
+      - Keep description brief but clear
+      - Count total characters before submitting
+    user_prompt: |
+      Generate a short, focused commit message for the MAIN change only.
+      Branch: {{.branch}}
+
+      Primary changes (pick one):
+      {{.summary}}
