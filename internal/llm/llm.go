@@ -253,6 +253,24 @@ func (c *OpenAIClient) makeRequest(ctx context.Context, requestJSON []byte) (*Ch
 //
 //nolint:cyclop // Complex function handling tool calls and responses
 func CallTool(ctx context.Context, client Client, tool *config.Tool, input interface{}) (string, error) {
+	// Create base log event
+	logEvent := logger.Info().Str("tool", tool.Name)
+
+	// Try to extract filename for info message if it exists
+	if inputMap, ok := input.(map[string]interface{}); ok {
+		if file, exists := inputMap["file"]; exists {
+			if filename, ok := file.(string); ok {
+				logEvent = logEvent.Str("file", filename)
+			}
+		}
+	}
+	logEvent.Msg("Calling LLM tool")
+
+	logger.Debug().
+		Str("tool", tool.Name).
+		Interface("input", input).
+		Msg("Tool input details")
+
 	if err := validateToolConfig(tool); err != nil {
 		return "", err
 	}
@@ -297,7 +315,6 @@ func CallTool(ctx context.Context, client Client, tool *config.Tool, input inter
 		return "", errors.Wrap(errors.CodeTemplateError, err)
 	}
 
-	// Add debug logging for request
 	logger.Debug().
 		Str("tool_name", tool.Name).
 		Str("system_prompt", tool.SystemPrompt).
@@ -308,8 +325,17 @@ func CallTool(ctx context.Context, client Client, tool *config.Tool, input inter
 	// Make the LLM call
 	response, err := client.GenerateText(ctx, tool.SystemPrompt, userPrompt, tools)
 	if err != nil {
+		logger.Warn().
+			Err(err).
+			Str("tool", tool.Name).
+			Msg("LLM call failed")
 		return "", err
 	}
+
+	logger.Debug().
+		Str("tool", tool.Name).
+		Str("response", response).
+		Msg("Received LLM response")
 
 	// Try to parse as tool call response first
 	if strings.HasPrefix(response, "{") && strings.HasSuffix(response, "}") {
@@ -332,7 +358,6 @@ func CallTool(ctx context.Context, client Client, tool *config.Tool, input inter
 			}
 		}
 
-		// If we can't parse it as our expected format, log and return as-is
 		logger.Debug().
 			Str("tool_name", tool.Name).
 			Str("response", response).

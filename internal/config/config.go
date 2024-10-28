@@ -2,7 +2,9 @@ package config
 
 import (
 	"flag"
+	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -18,6 +20,11 @@ const (
 	DefaultRequestTimeout   = 30 * time.Second
 	DefaultLogFilePerms     = 0o666
 	DefaultLineLength       = 72
+
+	// Common time formats
+	TimeFormatRFC3339 = "2006-01-02T15:04:05Z07:00"
+	TimeFormatUnix    = "2006-01-02 15:04:05"
+	TimeFormatSimple  = "2006-01-02"
 )
 
 type Config struct {
@@ -33,12 +40,26 @@ type CLIConfig struct {
 }
 
 type LoggingConfig struct {
-	Environment string
-	TimeFormat  string
-	Output      string
-	Level       string
-	Path        string `mapstructure:"file_path"`
-	FilePerms   int    `mapstructure:"file_perms"`
+	// Current environment name
+	Env string `mapstructure:"env"`
+	// Backward compatibility fields
+	Environment string `mapstructure:"environment,omitempty"`
+	TimeFormat  string `mapstructure:"timeformat,omitempty"`
+	Output      string `mapstructure:"output,omitempty"`
+	Level       string `mapstructure:"level,omitempty"`
+	Path        string `mapstructure:"file_path,omitempty"`
+	FilePerms   int    `mapstructure:"file_perms,omitempty"`
+	// New multi-environment support
+	Environments []EnvironmentConfig `mapstructure:"environments,omitempty"`
+}
+
+type EnvironmentConfig struct {
+	Name       string `mapstructure:"name"`
+	TimeFormat string `mapstructure:"timeformat"`
+	Output     string `mapstructure:"output"`
+	Level      string `mapstructure:"level"`
+	Path       string `mapstructure:"file_path,omitempty"`
+	FilePerms  int    `mapstructure:"file_perms,omitempty"`
 }
 
 type GitConfig struct {
@@ -85,10 +106,20 @@ type Property struct {
 }
 
 func Load() (*Config, error) {
+	viper.Reset()
+
 	viper.SetConfigName(".bumpa")
 	viper.SetConfigType("yaml")
 	viper.AddConfigPath(".")
+
+	// Bind environment variables
+	viper.BindEnv("logging.level", "BUMPA_LOG_LEVEL")
+	viper.BindEnv("logging.environment", "BUMPA_ENVIRONMENT")
+
+	// Enable environment variables
 	viper.AutomaticEnv()
+	viper.SetEnvPrefix("BUMPA")
+	viper.SetEnvKeyReplacer(strings.NewReplacer(".", "_"))
 
 	setDefaults()
 
@@ -114,44 +145,97 @@ func Load() (*Config, error) {
 		)
 	}
 
-	logger.Debug().
-		Str("provider", cfg.LLM.Provider).
-		Str("base_url", cfg.LLM.BaseURL).
-		Str("model", cfg.LLM.Model).
-		Msg("Loaded LLM configuration")
-
-	// Add validation for tool prompts
-	for i := range cfg.Tools {
-		if strings.TrimSpace(cfg.Tools[i].SystemPrompt) == "" { // Field name remains camelCase in Go code
-			return nil, errors.WrapWithContext(
-				errors.CodeConfigError,
-				errors.ErrInvalidInput,
-				"missing system prompt for tool: "+cfg.Tools[i].Name,
-			)
-		}
-		if strings.TrimSpace(cfg.Tools[i].UserPrompt) == "" { // Field name remains camelCase in Go code
-			return nil, errors.WrapWithContext(
-				errors.CodeConfigError,
-				errors.ErrInvalidInput,
-				"missing user prompt for tool: "+cfg.Tools[i].Name,
-			)
-		}
+	// Validate configuration
+	if err := validateConfig(&cfg); err != nil {
+		return nil, err
 	}
 
-	// Validate required tools exist
-	if !hasRequiredTools(cfg.Tools) {
-		return nil, errors.WrapWithContext(
-			errors.CodeConfigError,
-			errors.ErrInvalidInput,
-			"missing required tools configuration",
-		)
-	}
-
+	// Parse command line flags last to override file config
 	if err := ParseFlags(&cfg); err != nil {
 		return nil, err
 	}
 
 	return &cfg, nil
+}
+
+func LoadInitialLogging() (*LoggingConfig, error) {
+	// Reset viper state
+	viper.Reset()
+
+	// Set up viper for initial config load
+	viper.SetConfigName(".bumpa")
+	viper.SetConfigType("yaml")
+	viper.AddConfigPath(".")
+
+	// Bind environment variables first
+	viper.BindEnv("logging.level", "BUMPA_LOG_LEVEL")
+	viper.BindEnv("logging.environment", "BUMPA_ENVIRONMENT")
+
+	// Enable environment variables
+	viper.AutomaticEnv()
+	viper.SetEnvPrefix("BUMPA")
+	viper.SetEnvKeyReplacer(strings.NewReplacer(".", "_"))
+
+	// Set logging defaults (only if env vars are not set)
+	if viper.GetString("logging.level") == "" {
+		viper.SetDefault("logging.level", "info")
+	}
+	if viper.GetString("logging.environment") == "" {
+		viper.SetDefault("logging.environment", "development")
+	}
+	viper.SetDefault("logging.timeformat", time.RFC3339)
+	viper.SetDefault("logging.output", "console")
+	viper.SetDefault("logging.file_perms", DefaultLogFilePerms)
+
+	// Try to read config file
+	if err := viper.ReadInConfig(); err != nil {
+		var configFileNotFound viper.ConfigFileNotFoundError
+		if errors.As(err, &configFileNotFound) {
+			// Return current config (with env vars and defaults)
+			return &LoggingConfig{
+				Environment: viper.GetString("logging.environment"),
+				TimeFormat:  viper.GetString("logging.timeformat"),
+				Output:      viper.GetString("logging.output"),
+				Level:       viper.GetString("logging.level"),
+				FilePerms:   viper.GetInt("logging.file_perms"),
+			}, nil
+		}
+		return nil, errors.WrapWithContext(
+			errors.CodeConfigError,
+			err,
+			"failed to read config file",
+		)
+	}
+
+	var cfg struct {
+		Logging LoggingConfig `mapstructure:"logging"`
+	}
+
+	if err := viper.Unmarshal(&cfg); err != nil {
+		return nil, errors.WrapWithContext(
+			errors.CodeConfigError,
+			err,
+			"failed to unmarshal logging config",
+		)
+	}
+
+	// Get active environment configuration
+	active := cfg.Logging.ActiveEnvironment()
+
+	// Environment variables should only override if explicitly set
+	if envLevel := os.Getenv("BUMPA_LOG_LEVEL"); envLevel != "" {
+		active.Level = envLevel
+	}
+
+	return &LoggingConfig{
+		Env:         cfg.Logging.Env,
+		Environment: active.Name,
+		TimeFormat:  active.TimeFormat,
+		Output:      active.Output,
+		Level:       active.Level,
+		Path:        active.Path,
+		FilePerms:   active.FilePerms,
+	}, nil
 }
 
 func setDefaults() {
@@ -163,13 +247,163 @@ func setDefaults() {
 	viper.SetDefault("llm.commit_msg_timeout", DefaultCommitMsgTimeout)
 	viper.SetDefault("llm.request_timeout", DefaultRequestTimeout)
 	viper.SetDefault("logging.environment", "development")
-	viper.SetDefault("logging.timeformat", time.RFC3339)
+	viper.SetDefault("logging.timeformat", TimeFormatRFC3339)
 	viper.SetDefault("logging.output", "console")
 	viper.SetDefault("logging.level", "info")
 	viper.SetDefault("logging.file_perms", DefaultLogFilePerms)
 	viper.SetDefault("git.include_gitignore", true)
 	viper.SetDefault("git.max_diff_lines", DefaultMaxDiffLines)
 	viper.SetDefault("git.preferred_line_length", DefaultLineLength)
+}
+
+func validateConfig(cfg *Config) error {
+	// Validate tool prompts
+	for i := range cfg.Tools {
+		if strings.TrimSpace(cfg.Tools[i].SystemPrompt) == "" {
+			return errors.WrapWithContext(
+				errors.CodeConfigError,
+				errors.ErrInvalidInput,
+				"missing system prompt for tool: "+cfg.Tools[i].Name,
+			)
+		}
+		if strings.TrimSpace(cfg.Tools[i].UserPrompt) == "" {
+			return errors.WrapWithContext(
+				errors.CodeConfigError,
+				errors.ErrInvalidInput,
+				"missing user prompt for tool: "+cfg.Tools[i].Name,
+			)
+		}
+		// Environment variables take precedence over config file
+		if envLevel := os.Getenv("BUMPA_LOG_LEVEL"); envLevel != "" {
+			viper.SetDefault("logging.level", envLevel)
+		}
+		if envEnv := os.Getenv("BUMPA_ENVIRONMENT"); envEnv != "" {
+			viper.SetDefault("logging.environment", envEnv)
+		}
+
+		// Add environment variable bindings
+		viper.BindEnv("logging.level", "BUMPA_LOG_LEVEL")
+		viper.BindEnv("logging.environment", "BUMPA_ENVIRONMENT")
+	}
+
+	// Validate required tools exist
+	if !hasRequiredTools(cfg.Tools) {
+		return errors.WrapWithContext(
+			errors.CodeConfigError,
+			errors.ErrInvalidInput,
+			"missing required tools configuration",
+		)
+	}
+
+	return nil
+}
+
+func (c *EnvironmentConfig) Validate() error {
+	// Validate time format by attempting to parse a known time string
+	if c.TimeFormat != "" {
+		// Use a reference time that includes all components
+		referenceTime := time.Date(2006, 1, 2, 15, 4, 5, 0, time.UTC)
+
+		// Try to format using the provided format string
+		var formatErr error
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					formatErr = errors.WrapWithContext(
+						errors.CodeConfigError,
+						errors.ErrInvalidInput,
+						fmt.Sprintf("invalid time format: %s", c.TimeFormat),
+					)
+				}
+			}()
+			_ = referenceTime.Format(c.TimeFormat)
+		}()
+
+		if formatErr != nil {
+			return formatErr
+		}
+	}
+
+	// Validate output and file path combination
+	if c.Output == "file" {
+		if c.Path == "" {
+			return errors.WrapWithContext(
+				errors.CodeConfigError,
+				errors.ErrInvalidInput,
+				"file output requires file_path to be set",
+			)
+		}
+
+		// Check if file path is writable
+		dir := filepath.Dir(c.Path)
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			return errors.WrapWithContext(
+				errors.CodeConfigError,
+				err,
+				"failed to create log directory: "+dir,
+			)
+		}
+
+		// Try to open file
+		f, err := os.OpenFile(c.Path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, os.FileMode(c.FilePerms))
+		if err != nil {
+			return errors.WrapWithContext(
+				errors.CodeConfigError,
+				err,
+				"failed to open log file: "+c.Path,
+			)
+		}
+		f.Close()
+	}
+
+	// Validate log level
+	if !isValidLogLevel(c.Level) {
+		return errors.WrapWithContext(
+			errors.CodeConfigError,
+			errors.ErrInvalidInput,
+			"invalid log level: "+c.Level,
+		)
+	}
+
+	return nil
+}
+
+func isValidLogLevel(level string) bool {
+	switch strings.ToLower(level) {
+	case "debug", "info", "warn", "error", "fatal":
+		return true
+	default:
+		return false
+	}
+}
+
+func (c *LoggingConfig) ActiveEnvironment() *EnvironmentConfig {
+	// Check for environment variable override
+	envName := os.Getenv("BUMPA_ENVIRONMENT")
+	if envName == "" {
+		// Use env field if set, fall back to environment field for compatibility
+		envName = c.Env
+		if envName == "" {
+			envName = c.Environment
+		}
+	}
+
+	// Look for matching environment config
+	for i := range c.Environments {
+		if c.Environments[i].Name == envName {
+			return &c.Environments[i]
+		}
+	}
+
+	// Fall back to legacy single-environment config
+	return &EnvironmentConfig{
+		Name:       envName,
+		TimeFormat: c.TimeFormat,
+		Output:     c.Output,
+		Level:      c.Level,
+		Path:       c.Path,
+		FilePerms:  c.FilePerms,
+	}
 }
 
 func FindTool(tools []Tool, name string) *Tool {

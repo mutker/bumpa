@@ -3,7 +3,7 @@ package logger
 import (
 	"io"
 	"os"
-	"syscall"
+	"strings"
 
 	"codeberg.org/mutker/bumpa/internal/errors"
 	"github.com/rs/zerolog"
@@ -34,10 +34,12 @@ func Init(environment, timeFormat, output, level, path string) error {
 	}
 
 	logLevel := getLogLevel(level)
-	logLevel = adjustLogLevelForEnvironment(environment, logLevel)
 
 	zerolog.SetGlobalLevel(logLevel)
-	logger = zerolog.New(consoleWriter).With().Timestamp().Str("environment", environment).Logger()
+	logger = zerolog.New(consoleWriter).With().
+		Timestamp().
+		Str("environment", environment).
+		Logger()
 
 	return nil
 }
@@ -69,37 +71,35 @@ func adjustLogLevelForEnvironment(environment string, logLevel zerolog.Level) ze
 }
 
 func getLogLevel(level string) zerolog.Level {
-	switch level {
+	// zerolog levels are in reverse order (lower is more verbose):
+	// trace(-1) -> debug(0) -> info(1) -> warn(2) -> error(3) -> fatal(4) -> panic(5)
+	// Setting warn means "show warn and above (error, fatal)"
+	// Setting info means "show info and above (warn, error, fatal)"
+	switch strings.ToLower(level) {
+	case "trace":
+		return zerolog.TraceLevel // -1: most verbose
 	case "debug":
-		return zerolog.DebugLevel
+		return zerolog.DebugLevel // 0: very verbose
 	case "info":
-		return zerolog.InfoLevel
+		return zerolog.InfoLevel // 1: normal verbosity
 	case "warn":
-		return zerolog.WarnLevel
+		return zerolog.WarnLevel // 2: warnings only
 	case "error":
-		return zerolog.ErrorLevel
+		return zerolog.ErrorLevel // 3: errors only
+	case "fatal":
+		return zerolog.FatalLevel // 4: fatal only
 	default:
-		return zerolog.InfoLevel
+		return zerolog.InfoLevel // default to info
 	}
+}
+
+func shouldLog(messageLevel, configLevel zerolog.Level) bool {
+	// In zerolog, we show messages when their level is >= configured level
+	return messageLevel >= configLevel
 }
 
 func SetLogLevel(level LogLevel) {
 	zerolog.SetGlobalLevel(zerolog.Level(level))
-}
-
-// IsService checks if the application is running as a service
-func IsService() bool {
-	if _, err := os.Stdin.Stat(); err != nil {
-		return true
-	}
-	if os.Getenv("SERVICE_NAME") != "" || os.Getenv("INVOCATION_ID") != "" {
-		return true
-	}
-	if os.Getppid() == 1 {
-		return true
-	}
-
-	return syscall.Getpgrp() == syscall.Getpid()
 }
 
 // Debug logs a debug message

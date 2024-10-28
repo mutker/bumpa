@@ -27,7 +27,8 @@ const (
 	CodeLLMError      = "llm_error"      // LLM related errors
 	CodeInputError    = "input_error"    // User input errors
 	CodeTemplateError = "template_error" // Template processing errors
-	CodeInvalidState  = "invalid_state"  // Invalid application state
+	CodeNoChanges     = "no_changes"     // No files staged for commit
+	CodeLLMGenFailed  = "llm_gen_failed" // Failed to generate valid commit message
 )
 
 // Standard error messages
@@ -42,7 +43,8 @@ var errorMessages = map[string]string{
 	CodeLLMError:      "LLM operation failed",
 	CodeInputError:    "invalid input provided",
 	CodeTemplateError: "template processing failed",
-	CodeInvalidState:  "invalid application state",
+	CodeNoChanges:     "no changes staged for commit",
+	CodeLLMGenFailed:  "failed to generate valid commit message",
 }
 
 // Common errors

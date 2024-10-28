@@ -7,7 +7,6 @@ import (
 	"os"
 	"os/exec"
 	"strings"
-	"time"
 
 	"codeberg.org/mutker/bumpa/internal/commit"
 	"codeberg.org/mutker/bumpa/internal/config"
@@ -37,13 +36,26 @@ func main() {
 }
 
 func run() error {
-	if err := initializeLogger(); err != nil {
+	// Initialize logging first with initial config
+	loggingConfig, err := config.LoadInitialLogging()
+	if err != nil {
 		return errors.Wrap(errors.CodeInitFailed, err)
 	}
 
-	cfg, err := loadConfig()
+	if err := logger.Init(
+		loggingConfig.Environment,
+		loggingConfig.TimeFormat,
+		loggingConfig.Output,
+		loggingConfig.Level,
+		loggingConfig.Path,
+	); err != nil {
+		return errors.Wrap(errors.CodeInitFailed, err)
+	}
+
+	// Load full configuration
+	cfg, err := config.Load()
 	if err != nil {
-		return err
+		return errors.Wrap(errors.CodeConfigError, err)
 	}
 
 	logger.Debug().
@@ -67,24 +79,6 @@ func run() error {
 	}
 
 	return nil
-}
-
-func initializeLogger() error {
-	err := logger.Init("development", time.RFC3339, "console", "info", "")
-	if err != nil {
-		return errors.Wrap(errors.CodeInitFailed, err)
-	}
-
-	return nil
-}
-
-func loadConfig() (*config.Config, error) {
-	cfg, err := config.Load()
-	if err != nil {
-		return nil, errors.Wrap(errors.CodeConfigError, err)
-	}
-
-	return cfg, nil
 }
 
 //nolint:ireturn // Interface return needed for flexibility and testing
@@ -143,7 +137,15 @@ func runCommit(ctx context.Context, cfg *config.Config, llmClient llm.Client, re
 		message, err := generator.Generate(ctx)
 		if err != nil {
 			if errors.Is(err, errors.ErrInvalidInput) {
-				logger.Info().Msg(errors.GetMessage(errors.CodeInvalidState))
+				code := errors.GetCode(err)
+				switch code {
+				case errors.CodeNoChanges:
+					logger.Info().Msg("No changes to commit")
+				case errors.CodeLLMGenFailed:
+					logger.Error().Err(err).Msg("Failed to generate commit message")
+				default:
+					logger.Error().Err(err).Msg("Unexpected error")
+				}
 				return nil
 			}
 			return errors.Wrap(errors.CodeGitError, err)
@@ -155,21 +157,20 @@ func runCommit(ctx context.Context, cfg *config.Config, llmClient llm.Client, re
 		}
 
 		switch userAction.Command {
-		case commitCommand:
+		case commitCommand, editCommand:
 			if err := repo.MakeCommit(ctx, userAction.Message, filesToCommit); err != nil {
+				if errors.Is(err, errors.ErrInvalidInput) {
+					// For user configuration errors, show the message directly
+					fmt.Fprintln(os.Stderr, "\nError:", err)
+					return nil
+				}
 				return errors.Wrap(errors.CodeGitError, err)
 			}
 			logger.Info().Msg("Commit successfully created")
 			return nil
-		case editCommand:
-			if err := repo.MakeCommit(ctx, userAction.Message, filesToCommit); err != nil {
-				return errors.Wrap(errors.CodeGitError, err)
-			}
-			logger.Info().Msg("Commit successfully created with edited message")
-			return nil
 		case retryCommand:
 			logger.Info().Msg("Retrying commit message generation")
-			continue // Simply loop and generate again
+			continue
 		case quitCommand:
 			logger.Info().Msg("Commit aborted")
 			return nil

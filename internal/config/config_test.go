@@ -1,0 +1,155 @@
+package config
+
+import (
+	"os"
+	"strings"
+	"testing"
+
+	"github.com/spf13/viper"
+)
+
+func TestLogLevelOverride(t *testing.T) {
+	tests := []struct {
+		name      string
+		envLevel  string
+		envName   string
+		wantLevel string
+		wantEnv   string
+	}{
+		{
+			name:      "Default Level",
+			envLevel:  "",
+			wantLevel: "info",
+			wantEnv:   "development",
+		},
+		{
+			name:      "Debug Override in Development",
+			envLevel:  "debug",
+			envName:   "development",
+			wantLevel: "debug",
+			wantEnv:   "development",
+		},
+		{
+			name:      "Debug in Production",
+			envLevel:  "debug",
+			envName:   "production",
+			wantLevel: "debug", // Raw config value should be debug
+			wantEnv:   "production",
+		},
+		{
+			name:      "Warning Level",
+			envLevel:  "warn",
+			wantLevel: "warn",
+			wantEnv:   "development",
+		},
+		{
+			name:      "Error Level",
+			envLevel:  "error",
+			wantLevel: "error",
+			wantEnv:   "development",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Reset environment and viper
+			os.Clearenv()
+			viper.Reset()
+
+			// Set test environment
+			if tt.envLevel != "" {
+				t.Setenv("BUMPA_LOG_LEVEL", tt.envLevel)
+			}
+			if tt.envName != "" {
+				t.Setenv("BUMPA_ENVIRONMENT", tt.envName)
+			}
+
+			// Load config
+			cfg, err := LoadInitialLogging()
+			if err != nil {
+				t.Fatalf("LoadInitialLogging() error = %v", err)
+			}
+
+			// Check results
+			if got := cfg.Level; got != tt.wantLevel {
+				t.Errorf("LoadInitialLogging() level = %v, want %v", got, tt.wantLevel)
+			}
+
+			// Verify environment
+			if got := cfg.Environment; got != tt.wantEnv {
+				t.Errorf("LoadInitialLogging() environment = %v, want %v", got, tt.wantEnv)
+			}
+		})
+	}
+}
+
+func TestEnvironmentConfigValidation(t *testing.T) {
+	tests := []struct {
+		name    string
+		config  EnvironmentConfig
+		wantErr bool
+	}{
+		{
+			name: "Valid Development Config",
+			config: EnvironmentConfig{
+				Name:       "development",
+				TimeFormat: "2006-01-02T15:04:05Z07:00",
+				Output:     "console",
+				Level:      "debug",
+			},
+			wantErr: false,
+		},
+		{
+			name: "Valid Production Config",
+			config: EnvironmentConfig{
+				Name:       "production",
+				TimeFormat: "2006-01-02 15:04:05",
+				Output:     "file",
+				Level:      "info",
+				Path:       "test.log",
+				FilePerms:  0o644,
+			},
+			wantErr: false,
+		},
+		{
+			name: "Invalid Time Format",
+			config: EnvironmentConfig{
+				TimeFormat: "invalid",
+			},
+			wantErr: true,
+		},
+		{
+			name: "Missing File Path",
+			config: EnvironmentConfig{
+				Output: "file",
+			},
+			wantErr: true,
+		},
+		{
+			name: "Invalid Log Level",
+			config: EnvironmentConfig{
+				Level: "invalid",
+			},
+			wantErr: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := tt.config.Validate()
+			if (err != nil) != tt.wantErr {
+				t.Errorf("EnvironmentConfig.Validate() error = %v, wantErr %v", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+// Add helper function to check log levels
+func IsValidLogLevel(level string) bool {
+	switch strings.ToLower(level) {
+	case "trace", "debug", "info", "warn", "error", "fatal", "panic":
+		return true
+	default:
+		return false
+	}
+}
