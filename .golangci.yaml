@@ -91,5 +91,5 @@ issues:
   max-issues-per-linter: 0
   max-same-issues: 0
   new: false
-  fix: true
+  fix: false
   whole-files: true

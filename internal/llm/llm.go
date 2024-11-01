@@ -7,8 +7,10 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
 	"text/template"
+	"time"
 
 	"codeberg.org/mutker/bumpa/internal/config"
 	"codeberg.org/mutker/bumpa/internal/errors"
@@ -103,10 +105,11 @@ type Client interface {
 
 // OpenAIClient implements OpenAI-compatible API client (works for both OpenAI and Ollama)
 type OpenAIClient struct {
-	url    string
-	token  string // Optional for Ollama
-	model  string
-	client *http.Client
+	url         string
+	token       string // Optional for Ollama
+	model       string
+	client      *http.Client
+	rateLimiter *RateLimiter
 }
 
 // New creates a new OpenAIClient
@@ -132,12 +135,11 @@ func New(cfg *config.LLMConfig) (Client, error) {
 	}
 
 	return &OpenAIClient{
-		url:   cfg.BaseURL,
-		token: cfg.APIKey,
-		model: cfg.Model,
-		client: &http.Client{
-			Timeout: cfg.RequestTimeout,
-		},
+		url:         cfg.BaseURL,
+		token:       cfg.APIKey,
+		model:       cfg.Model,
+		client:      &http.Client{Timeout: cfg.RequestTimeout},
+		rateLimiter: NewRateLimiter(),
 	}, nil
 }
 
@@ -186,67 +188,124 @@ func (c *OpenAIClient) GenerateText(ctx context.Context, systemPrompt, userPromp
 }
 
 func (c *OpenAIClient) makeRequest(ctx context.Context, requestJSON []byte) (*ChatResponse, error) {
+	estimatedTokens := EstimateTokens(requestJSON)
+	c.rateLimiter.WaitForCapacity(estimatedTokens)
+
 	endpoint := strings.TrimSuffix(c.url, "/") + "/chat/completions"
 
-	logger.Debug().
-		Str("url", endpoint).
-		RawJSON("request", requestJSON).
-		Msg("Making LLM request")
+	for {
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewBuffer(requestJSON))
+		if err != nil {
+			return nil, errors.WrapWithContext(errors.CodeLLMError, err, "failed to create request")
+		}
 
-	req, err := http.NewRequestWithContext(
-		ctx,
-		http.MethodPost,
-		endpoint,
-		bytes.NewBuffer(requestJSON),
-	)
-	if err != nil {
-		return nil, errors.WrapWithContext(
-			errors.CodeLLMError,
-			err,
-			"failed to create request",
-		)
+		req.Header.Set("Content-Type", "application/json")
+		if c.token != "" {
+			req.Header.Set("Authorization", "Bearer "+c.token)
+		}
+
+		resp, err := c.client.Do(req)
+		if err != nil {
+			return nil, errors.WrapWithContext(errors.CodeLLMError, err, "failed to make request")
+		}
+
+		// Parse rate limit headers
+		rateLimitInfo, err := parseRateLimitHeaders(resp.Header)
+		if err != nil {
+			resp.Body.Close()
+			logger.Warn().Err(err).Msg("Failed to parse rate limit headers")
+		} else {
+			c.rateLimiter.UpdateLimits(rateLimitInfo)
+		}
+
+		// Handle 429 Too Many Requests
+		if resp.StatusCode == http.StatusTooManyRequests {
+			resp.Body.Close()
+			retryDuration := defaultRetryDuration
+			if rateLimitInfo.RetryAfter > 0 {
+				retryDuration = rateLimitInfo.RetryAfter
+			}
+			HandleRetryAfter(retryDuration)
+			continue
+		}
+
+		// Handle other response cases
+		if resp.StatusCode != http.StatusOK {
+			body, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			return nil, errors.WrapWithContext(
+				errors.CodeLLMError,
+				errors.ErrLLMStatus,
+				fmt.Sprintf("HTTP %d: %s", resp.StatusCode, string(body)),
+			)
+		}
+
+		var result ChatResponse
+		if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+			resp.Body.Close()
+			return nil, errors.WrapWithContext(errors.CodeLLMError, err, "failed to decode response")
+		}
+		resp.Body.Close()
+		return &result, nil
+	}
+}
+
+// EstimateTokens estimates the number of tokens in a JSON request
+func EstimateTokens(requestJSON []byte) int {
+	return len(requestJSON) / tokenSizeMultiplier
+}
+
+// parseRateLimitHeaders parses rate limit information from response headers
+func parseRateLimitHeaders(headers http.Header) (RateLimitInfo, error) {
+	info := RateLimitInfo{}
+	var parseErr error
+
+	// Helper function to parse integers from headers
+	parseIntHeader := func(header string) (int, error) {
+		val := headers.Get(header)
+		if val == "" {
+			return 0, nil
+		}
+		return strconv.Atoi(val)
 	}
 
-	// Add required headers
-	req.Header.Set("Content-Type", "application/json")
-	if c.token != "" { // Only set Authorization if token is provided
-		req.Header.Set("Authorization", "Bearer "+c.token)
+	// Helper function to parse durations from headers
+	parseDurationHeader := func(header string) (time.Duration, error) {
+		val := headers.Get(header)
+		if val == "" {
+			return 0, nil
+		}
+		return time.ParseDuration(val)
 	}
 
-	resp, err := c.client.Do(req)
-	if err != nil {
-		return nil, errors.WrapWithContext(
-			errors.CodeLLMError,
-			err,
-			"failed to make request",
-		)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		logger.Debug().
-			Int("status", resp.StatusCode).
-			Str("body", string(body)).
-			Msg("LLM request failed")
-
-		return nil, errors.WrapWithContext(
-			errors.CodeLLMError,
-			errors.ErrLLMStatus,
-			fmt.Sprintf("HTTP %d: %s", resp.StatusCode, string(body)),
-		)
+	// Parse remaining tokens and requests
+	if info.RemainingTokens, parseErr = parseIntHeader(headerRemainingTokens); parseErr != nil {
+		return info, errors.WrapWithContext(errors.CodeLLMError, parseErr, "invalid remaining tokens header")
 	}
 
-	var result ChatResponse
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return nil, errors.WrapWithContext(
-			errors.CodeLLMError,
-			err,
-			"failed to decode response",
-		)
+	if info.RemainingRequests, parseErr = parseIntHeader(headerRemainingRequests); parseErr != nil {
+		return info, errors.WrapWithContext(errors.CodeLLMError, parseErr, "invalid remaining requests header")
 	}
 
-	return &result, nil
+	// Parse reset durations
+	if info.TokensResetIn, parseErr = parseDurationHeader(headerResetTokens); parseErr != nil {
+		return info, errors.WrapWithContext(errors.CodeLLMError, parseErr, "invalid tokens reset header")
+	}
+
+	if info.RequestsResetIn, parseErr = parseDurationHeader(headerResetRequests); parseErr != nil {
+		return info, errors.WrapWithContext(errors.CodeLLMError, parseErr, "invalid requests reset header")
+	}
+
+	// Parse retry-after
+	if retryAfter := headers.Get(headerRetryAfter); retryAfter != "" { //nolint:canonicalheader // Using lowercase as per API spec
+		seconds, err := strconv.Atoi(retryAfter)
+		if err != nil {
+			return info, errors.WrapWithContext(errors.CodeLLMError, err, "invalid retry-after header")
+		}
+		info.RetryAfter = time.Duration(seconds) * time.Second
+	}
+
+	return info, nil
 }
 
 // CallTool generates text using the LLM client with tool-specific formatting
