@@ -232,7 +232,11 @@ func (r *Repository) GetFilesToCommit() ([]string, error) {
 
 	if len(files) == 0 {
 		logger.Info().Msg("No changes to commit")
-		return nil, errors.New(errors.CodeInvalidState)
+		return nil, errors.WrapWithContext(
+			errors.CodeNoChanges,
+			errors.ErrInvalidInput,
+			"no changes are staged for commit - use 'git add' to stage files",
+		)
 	}
 
 	logger.Debug().Int("fileCount", len(files)).Msg("Files to commit")
@@ -266,7 +270,11 @@ func (r *Repository) MakeCommit(ctx context.Context, message string, filesToAdd 
 		email := cfg.User.Email
 
 		if name == "" || email == "" {
-			return errors.New(errors.CodeInputError)
+			return errors.WrapWithContext(
+				errors.CodeGitError,
+				errors.ErrInvalidInput,
+				"git user not configured - run: git config --global user.name 'Your Name' && git config --global user.email 'your@email.com'",
+			)
 		}
 
 		_, err = w.Commit(message, &gogit.CommitOptions{
@@ -278,11 +286,8 @@ func (r *Repository) MakeCommit(ctx context.Context, message string, filesToAdd 
 			All: true,
 		})
 		if err != nil {
-			logger.Error().Err(err).Msg("Failed to create commit")
 			return errors.Wrap(errors.CodeGitError, err)
 		}
-
-		logger.Info().Msg("Commit created successfully")
 
 		return nil
 	}

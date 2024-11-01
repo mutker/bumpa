@@ -46,33 +46,37 @@ func NewGenerator(cfg *config.Config, llmClient llm.Client, repo *git.Repository
 }
 
 func (g *Generator) Generate(ctx context.Context) (string, error) {
-	logger.Debug().Msg("Starting commit message generation")
-
 	fileSummaries, err := g.getFileSummaries(ctx)
 	if err != nil {
-		return "", errors.WrapWithContext(
-			errors.CodeGitError,
-			err,
-			"failed to get file summaries",
-		)
+		if errors.Is(err, errors.ErrInvalidInput) {
+			return "", errors.WrapWithContext(
+				errors.CodeNoChanges, // Updated error code
+				err,
+				"no changes are staged for commit - use 'git add' to stage files",
+			)
+		}
+		return "", err
 	}
 
 	if len(fileSummaries) == 0 {
-		return "", errors.Wrap(
-			errors.CodeInvalidState,
+		return "", errors.WrapWithContext(
+			errors.CodeNoChanges,
 			errors.ErrInvalidInput,
+			"no changes are staged for commit - use 'git add' to stage files",
 		)
 	}
 
-	diffSummary := g.generateDiffSummary(fileSummaries)
+	logger.Info().Msgf("Analyzing changes in %d files", len(fileSummaries))
 
+	// Debug level for technical details
+	logger.Debug().
+		Interface("summaries", fileSummaries).
+		Msg("File change summaries")
+
+	diffSummary := g.generateDiffSummary(fileSummaries)
 	commitMessage, err := g.generateCommitMessageFromSummary(ctx, diffSummary)
 	if err != nil {
-		return "", errors.WrapWithContext(
-			errors.CodeLLMError,
-			err,
-			"failed to generate commit message",
-		)
+		return "", err
 	}
 
 	return strings.TrimSuffix(commitMessage, "."), nil
@@ -252,7 +256,7 @@ func (g *Generator) getFileSummaries(ctx context.Context) (map[string]string, er
 			return nil, errors.WrapWithContext(
 				errors.CodeGitError,
 				err,
-				"failed to generate summary for "+path, // Removed unnecessary fmt.Sprintf
+				"failed to generate summary for "+path,
 			)
 		}
 
@@ -260,8 +264,11 @@ func (g *Generator) getFileSummaries(ctx context.Context) (map[string]string, er
 	}
 
 	if len(fileSummaries) == 0 {
-		// Return ErrInvalidInput instead of just a code
-		return nil, errors.Wrap(errors.CodeInvalidState, errors.ErrInvalidInput)
+		return nil, errors.WrapWithContext(
+			errors.CodeNoChanges,
+			errors.ErrInvalidInput,
+			"no changes are staged for commit - use 'git add' to stage files",
+		)
 	}
 
 	return fileSummaries, nil
@@ -284,7 +291,7 @@ func (g *Generator) generateCommitMessageFromSummary(ctx context.Context, summar
 
 		branchName, err := g.getCurrentBranch()
 		if err != nil {
-			return "", err // Already wrapped
+			return "", err
 		}
 
 		maxRetries := g.cfg.LLM.MaxRetries
@@ -292,71 +299,76 @@ func (g *Generator) generateCommitMessageFromSummary(ctx context.Context, summar
 			maxRetries = 1
 		}
 
-		input := map[string]interface{}{
-			"summary": summary,
-			"branch":  branchName,
-		}
-
 		var lastMessage string
 		var lastError string
 
 		for retries := 0; retries < maxRetries; retries++ {
-			logger.Debug().
-				Int("attempt", retries+1).
-				Int("maxRetries", maxRetries).
-				Msg("Attempting to generate commit message")
+			if retries == 0 {
+				logger.Info().Msg("Generating commit message")
+			} else {
+				logger.Info().
+					Int("attempt", retries+1).
+					Int("max_retries", maxRetries).
+					Str("error", lastError).
+					Msg("Retrying commit message generation")
+			}
 
 			// Use retry tool if this isn't the first attempt
 			currentTool := tool
+			input := map[string]interface{}{
+				"summary": summary,
+				"branch":  branchName,
+			}
+
 			if retries > 0 {
 				currentTool = g.findTool("retry_commit_message")
 				if currentTool == nil {
-					logger.Warn().Msg("Retry tool not found, falling back to original tool")
+					logger.Debug().Msg("Retry tool not found, using original tool")
 					currentTool = tool
-				} else {
-					input = map[string]interface{}{
-						"summary":  summary,
-						"branch":   branchName,
-						"previous": lastMessage,
-						"error":    lastError,
-					}
 				}
+				input["previous"] = lastMessage
+				input["error"] = lastError
 			}
 
 			message, err := llm.CallTool(ctx, g.llm, currentTool, input)
 			if err != nil {
-				return "", errors.WrapWithContext(
-					errors.CodeLLMError,
-					err,
-					fmt.Sprintf("failed to generate message (attempt %d/%d)", retries+1, maxRetries),
-				)
+				logger.Debug().
+					Err(err).
+					Int("attempt", retries+1).
+					Msg("Failed to generate message")
+				continue
 			}
 
 			message = cleanCommitMessage(message)
 
 			if g.isValidCommitMessage(message) {
-				logger.Info().
-					Str("message", message).
-					Int("attempts", retries+1).
-					Msg("Generated valid commit message")
 				return message, nil
 			}
 
-			if retries < maxRetries-1 {
-				lastMessage = message
-				lastError = g.analyzeInvalidMessage(message)
-				logger.Debug().
-					Str("message", message).
-					Str("reason", lastError).
-					Int("attempt", retries+1).
-					Msg("Invalid commit message")
-			}
+			lastMessage = message
+			lastError = g.analyzeInvalidMessage(message)
+
+			logger.Debug().
+				Str("message", message).
+				Str("error", lastError).
+				Int("attempt", retries+1).
+				Msg("Invalid commit message")
 		}
 
+		// Final error after all retries
+		logger.Info().
+			Msg("The LLM is struggling to generate a valid commit message." +
+				"Try running the command again, make the changes smaller, or commit manually")
+
+		logger.Warn().
+			Int("max_retries", maxRetries).
+			Str("reason", lastError).
+			Msg("Failed to generate valid commit message after retries")
+
 		return "", errors.WrapWithContext(
-			errors.CodeValidateError,
+			errors.CodeLLMGenFailed,
 			errors.ErrInvalidInput,
-			fmt.Sprintf("failed to generate valid commit message after %d attempts", maxRetries),
+			"failed to generate commit message: "+lastError,
 		)
 	}
 }
