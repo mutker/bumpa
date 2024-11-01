@@ -33,7 +33,7 @@ func Init(environment, timeFormat, output, level, path string) error {
 		TimeFormat: timeFormat,
 	}
 
-	logLevel := getLogLevel(level)
+	logLevel := GetLogLevel(level)
 
 	zerolog.SetGlobalLevel(logLevel)
 	logger = zerolog.New(consoleWriter).With().
@@ -42,6 +42,16 @@ func Init(environment, timeFormat, output, level, path string) error {
 		Logger()
 
 	return nil
+}
+
+func SetLogger(l *zerolog.Logger) {
+	if l != nil {
+		logger = *l
+	}
+}
+
+func GetLogger() zerolog.Logger {
+	return logger
 }
 
 func getWriter(output, path string) (io.Writer, error) {
@@ -57,20 +67,7 @@ func getWriter(output, path string) (io.Writer, error) {
 	return os.Stdout, nil
 }
 
-func adjustLogLevelForEnvironment(environment string, logLevel zerolog.Level) zerolog.Level {
-	switch environment {
-	case "development":
-		return zerolog.DebugLevel
-	case "production":
-		if logLevel < zerolog.InfoLevel {
-			return zerolog.InfoLevel
-		}
-	}
-
-	return logLevel
-}
-
-func getLogLevel(level string) zerolog.Level {
+func GetLogLevel(level string) zerolog.Level {
 	// zerolog levels are in reverse order (lower is more verbose):
 	// trace(-1) -> debug(0) -> info(1) -> warn(2) -> error(3) -> fatal(4) -> panic(5)
 	// Setting warn means "show warn and above (error, fatal)"
@@ -91,11 +88,6 @@ func getLogLevel(level string) zerolog.Level {
 	default:
 		return zerolog.InfoLevel // default to info
 	}
-}
-
-func shouldLog(messageLevel, configLevel zerolog.Level) bool {
-	// In zerolog, we show messages when their level is >= configured level
-	return messageLevel >= configLevel
 }
 
 func SetLogLevel(level LogLevel) {

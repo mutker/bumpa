@@ -1,10 +1,11 @@
-package config
+package config_test
 
 import (
 	"os"
 	"strings"
 	"testing"
 
+	"codeberg.org/mutker/bumpa/internal/config"
 	"github.com/spf13/viper"
 )
 
@@ -65,7 +66,7 @@ func TestLogLevelOverride(t *testing.T) {
 			}
 
 			// Load config
-			cfg, err := LoadInitialLogging()
+			cfg, err := config.LoadInitialLogging()
 			if err != nil {
 				t.Fatalf("LoadInitialLogging() error = %v", err)
 			}
@@ -86,12 +87,12 @@ func TestLogLevelOverride(t *testing.T) {
 func TestEnvironmentConfigValidation(t *testing.T) {
 	tests := []struct {
 		name    string
-		config  EnvironmentConfig
+		config  config.EnvironmentConfig
 		wantErr bool
 	}{
 		{
 			name: "Valid Development Config",
-			config: EnvironmentConfig{
+			config: config.EnvironmentConfig{
 				Name:       "development",
 				TimeFormat: "2006-01-02T15:04:05Z07:00",
 				Output:     "console",
@@ -101,7 +102,7 @@ func TestEnvironmentConfigValidation(t *testing.T) {
 		},
 		{
 			name: "Valid Production Config",
-			config: EnvironmentConfig{
+			config: config.EnvironmentConfig{
 				Name:       "production",
 				TimeFormat: "2006-01-02 15:04:05",
 				Output:     "file",
@@ -113,21 +114,21 @@ func TestEnvironmentConfigValidation(t *testing.T) {
 		},
 		{
 			name: "Invalid Time Format",
-			config: EnvironmentConfig{
+			config: config.EnvironmentConfig{
 				TimeFormat: "invalid",
 			},
 			wantErr: true,
 		},
 		{
 			name: "Missing File Path",
-			config: EnvironmentConfig{
+			config: config.EnvironmentConfig{
 				Output: "file",
 			},
 			wantErr: true,
 		},
 		{
 			name: "Invalid Log Level",
-			config: EnvironmentConfig{
+			config: config.EnvironmentConfig{
 				Level: "invalid",
 			},
 			wantErr: true,

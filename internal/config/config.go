@@ -2,7 +2,6 @@ package config
 
 import (
 	"flag"
-	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -18,7 +17,9 @@ const (
 	DefaultMaxDiffLines     = 10
 	DefaultCommitMsgTimeout = 30 * time.Second
 	DefaultRequestTimeout   = 30 * time.Second
-	DefaultLogFilePerms     = 0o666
+	DefaultLogFilePerms     = os.FileMode(0o666)
+	DefaultLogDirPerms      = os.FileMode(0o755)
+	DefaultPermissionsMask  = os.FileMode(0o777)
 	DefaultLineLength       = 72
 
 	// Common time formats
@@ -43,23 +44,24 @@ type LoggingConfig struct {
 	// Current environment name
 	Env string `mapstructure:"env"`
 	// Backward compatibility fields
-	Environment string `mapstructure:"environment,omitempty"`
-	TimeFormat  string `mapstructure:"timeformat,omitempty"`
-	Output      string `mapstructure:"output,omitempty"`
-	Level       string `mapstructure:"level,omitempty"`
-	Path        string `mapstructure:"file_path,omitempty"`
-	FilePerms   int    `mapstructure:"file_perms,omitempty"`
-	// New multi-environment support
+	Environment  string              `mapstructure:"environment,omitempty"`
+	TimeFormat   string              `mapstructure:"timeformat,omitempty"`
+	Output       string              `mapstructure:"output,omitempty"`
+	Level        string              `mapstructure:"level,omitempty"`
+	Path         string              `mapstructure:"file_path,omitempty"`
+	FilePerms    os.FileMode         `mapstructure:"file_perms,omitempty"`
+	DirPerms     os.FileMode         `mapstructure:"dir_perms,omitempty"`
 	Environments []EnvironmentConfig `mapstructure:"environments,omitempty"`
 }
 
 type EnvironmentConfig struct {
-	Name       string `mapstructure:"name"`
-	TimeFormat string `mapstructure:"timeformat"`
-	Output     string `mapstructure:"output"`
-	Level      string `mapstructure:"level"`
-	Path       string `mapstructure:"file_path,omitempty"`
-	FilePerms  int    `mapstructure:"file_perms,omitempty"`
+	Name       string      `mapstructure:"name"`
+	TimeFormat string      `mapstructure:"timeformat"`
+	Output     string      `mapstructure:"output"`
+	Level      string      `mapstructure:"level"`
+	Path       string      `mapstructure:"file_path,omitempty"`
+	FilePerms  os.FileMode `mapstructure:"file_perms,omitempty"`
+	DirPerms   os.FileMode `mapstructure:"dir_perms,omitempty"`
 }
 
 type GitConfig struct {
@@ -113,8 +115,12 @@ func Load() (*Config, error) {
 	viper.AddConfigPath(".")
 
 	// Bind environment variables
-	viper.BindEnv("logging.level", "BUMPA_LOG_LEVEL")
-	viper.BindEnv("logging.environment", "BUMPA_ENVIRONMENT")
+	if err := viper.BindEnv("logging.level", "BUMPA_LOG_LEVEL"); err != nil {
+		return nil, errors.Wrap(errors.CodeConfigError, err)
+	}
+	if err := viper.BindEnv("logging.environment", "BUMPA_ENVIRONMENT"); err != nil {
+		return nil, errors.Wrap(errors.CodeConfigError, err)
+	}
 
 	// Enable environment variables
 	viper.AutomaticEnv()
@@ -168,8 +174,12 @@ func LoadInitialLogging() (*LoggingConfig, error) {
 	viper.AddConfigPath(".")
 
 	// Bind environment variables first
-	viper.BindEnv("logging.level", "BUMPA_LOG_LEVEL")
-	viper.BindEnv("logging.environment", "BUMPA_ENVIRONMENT")
+	if err := viper.BindEnv("logging.level", "BUMPA_LOG_LEVEL"); err != nil {
+		return nil, errors.Wrap(errors.CodeConfigError, err)
+	}
+	if err := viper.BindEnv("logging.environment", "BUMPA_ENVIRONMENT"); err != nil {
+		return nil, errors.Wrap(errors.CodeConfigError, err)
+	}
 
 	// Enable environment variables
 	viper.AutomaticEnv()
@@ -197,7 +207,7 @@ func LoadInitialLogging() (*LoggingConfig, error) {
 				TimeFormat:  viper.GetString("logging.timeformat"),
 				Output:      viper.GetString("logging.output"),
 				Level:       viper.GetString("logging.level"),
-				FilePerms:   viper.GetInt("logging.file_perms"),
+				FilePerms:   safeFileMode(viper.GetInt("logging.file_perms")),
 			}, nil
 		}
 		return nil, errors.WrapWithContext(
@@ -235,6 +245,7 @@ func LoadInitialLogging() (*LoggingConfig, error) {
 		Level:       active.Level,
 		Path:        active.Path,
 		FilePerms:   active.FilePerms,
+		DirPerms:    active.DirPerms,
 	}, nil
 }
 
@@ -251,6 +262,7 @@ func setDefaults() {
 	viper.SetDefault("logging.output", "console")
 	viper.SetDefault("logging.level", "info")
 	viper.SetDefault("logging.file_perms", DefaultLogFilePerms)
+	viper.SetDefault("logging.dir_perms", DefaultLogDirPerms)
 	viper.SetDefault("git.include_gitignore", true)
 	viper.SetDefault("git.max_diff_lines", DefaultMaxDiffLines)
 	viper.SetDefault("git.preferred_line_length", DefaultLineLength)
@@ -282,8 +294,12 @@ func validateConfig(cfg *Config) error {
 		}
 
 		// Add environment variable bindings
-		viper.BindEnv("logging.level", "BUMPA_LOG_LEVEL")
-		viper.BindEnv("logging.environment", "BUMPA_ENVIRONMENT")
+		if err := viper.BindEnv("logging.level", "BUMPA_LOG_LEVEL"); err != nil {
+			return errors.Wrap(errors.CodeConfigError, err)
+		}
+		if err := viper.BindEnv("logging.environment", "BUMPA_ENVIRONMENT"); err != nil {
+			return errors.Wrap(errors.CodeConfigError, err)
+		}
 	}
 
 	// Validate required tools exist
@@ -296,6 +312,13 @@ func validateConfig(cfg *Config) error {
 	}
 
 	return nil
+}
+
+// Helper function for safe permission conversion
+//
+//nolint:gosec // Safe conversion as we explicitly mask to valid permission bits
+func safeFileMode(perms int) os.FileMode {
+	return os.FileMode(perms & int(DefaultLogFilePerms))
 }
 
 func (c *EnvironmentConfig) Validate() error {
@@ -312,7 +335,7 @@ func (c *EnvironmentConfig) Validate() error {
 					formatErr = errors.WrapWithContext(
 						errors.CodeConfigError,
 						errors.ErrInvalidInput,
-						fmt.Sprintf("invalid time format: %s", c.TimeFormat),
+						"invalid time format: "+c.TimeFormat,
 					)
 				}
 			}()
@@ -336,7 +359,7 @@ func (c *EnvironmentConfig) Validate() error {
 
 		// Check if file path is writable
 		dir := filepath.Dir(c.Path)
-		if err := os.MkdirAll(dir, 0o755); err != nil {
+		if err := os.MkdirAll(dir, DefaultLogDirPerms); err != nil {
 			return errors.WrapWithContext(
 				errors.CodeConfigError,
 				err,
@@ -345,7 +368,8 @@ func (c *EnvironmentConfig) Validate() error {
 		}
 
 		// Try to open file
-		f, err := os.OpenFile(c.Path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, os.FileMode(c.FilePerms))
+		perms := safeFileMode(int(c.FilePerms))
+		f, err := os.OpenFile(c.Path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, perms)
 		if err != nil {
 			return errors.WrapWithContext(
 				errors.CodeConfigError,

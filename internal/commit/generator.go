@@ -265,7 +265,7 @@ func (g *Generator) getFileSummaries(ctx context.Context) (map[string]string, er
 
 	if len(fileSummaries) == 0 {
 		return nil, errors.WrapWithContext(
-			errors.CodeNoChanges, // Use the new error code
+			errors.CodeNoChanges,
 			errors.ErrInvalidInput,
 			"no changes are staged for commit - use 'git add' to stage files",
 		)
@@ -368,7 +368,7 @@ func (g *Generator) generateCommitMessageFromSummary(ctx context.Context, summar
 		return "", errors.WrapWithContext(
 			errors.CodeLLMGenFailed,
 			errors.ErrInvalidInput,
-			fmt.Sprintf("failed to generate commit message: %s", lastError),
+			"failed to generate commit message: "+lastError,
 		)
 	}
 }
