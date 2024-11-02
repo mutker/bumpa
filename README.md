@@ -65,7 +65,7 @@ chmod +x .git/hooks/prepare-commit-msg
 
 ### In CI/CD workflows
 
-🚧 This has yet not been tested, and might not work as expected (or at all).
+🚧 This has not yet been implemented!
 
 Integrate bumpa into your CI/CD pipeline by adding it to your workflow configuration. For example, in a GitHub Actions workflow:
 
@@ -95,10 +95,10 @@ logging:
   level: debug
 
 llm:
-  provider: openai # or ollama
-  model: llama3-groq-70b-8192-tool-use-preview
-  base_url: https://api.groq.com/openai/v1
-  api_key: gsk_xxx
+  provider: openai-compatible
+  model: llama3-70b-tool-use
+  base_url: http://localhost:11434/v1
+  api_key: ""  # Optional, remove if not needed
   max_retries: 3
   request_timeout: 30s
   commit_msg_timeout: 30s

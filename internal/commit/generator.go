@@ -357,7 +357,7 @@ func (g *Generator) generateCommitMessageFromSummary(ctx context.Context, summar
 
 		// Final error after all retries
 		logger.Info().
-			Msg("The LLM is struggling to generate a valid commit message." +
+			Msg("The LLM is struggling to generate a valid commit message. " +
 				"Try running the command again, make the changes smaller, or commit manually")
 
 		logger.Warn().

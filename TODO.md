@@ -6,11 +6,11 @@
   - [x] Define configuration struct
 - [x] Implement logging facilities
   - [x] Implement LLM integration
-  - [x] Set up Ollama client
-  - [x] Set up OpenAI client
+  - [x] Set up OpenAI-compatible client
 - [x] Setup proper project structure according to [golang-standards/project-layout](https://github.com/golang-standards/project-layout)
 - [x] Implement logger and error management
 - [x] Fix all linting errors
+- [x] Implement rate limiting and retry logic
 
 ## Features
 - [ ] Implement `changelog` command
@@ -18,38 +18,39 @@
   - [x] Analyze git diff
   - [x] Generate commit message using LLM
   - [x] Generate a summary per file to minimize token use
+  - [x] Implement conventional commits validation
+  - [x] Add retry logic for failed generations
 - [ ] Implement `pr` command
 - [ ] Implement `release-notes` command
 - [ ] Implement `version` command
-  - [ ] Implement version bumping logic
-  - [ ] Parse and update VERSION file
-  - [ ] Implement semantic versioning rules
 
 ## Configuration
 - [x] Add support for custom LLM model configuration
-- [ ] Implement configuration validation
+- [x] Implement basic configuration validation
+- [ ] Add support for custom commit message templates
+- [ ] Add support for custom prompts
 
 ## Git
 - [ ] Create prepare-commit-msg hook
+- [x] Implement git diff analysis
+- [x] Add support for gitignore patterns
 
 ## Documentation
 - [ ] Write godoc comments for all exported functions and types
-- [ ] Create installation instructions
+- [x] Create basic installation instructions
 - [ ] Create usage examples for each command
 - [ ] Create git hook usage examples
 - [ ] Create CONTRIBUTING.md guide
 
-## Packaging and Distribution
-- [ ] Create PKGBUILD and Dockerfile
-- [ ] Set up Goreleaser configuration
-- [x] Create golangci-lint workflow
-- [ ] Create release workflow
-
 ## Testing
 - [ ] Set up testing framework and mocks
+- [x] Add basic logger tests
 - [ ] Write unit tests for core functionality
 - [ ] Write integration tests for CLI commands
 - [ ] Set up mock LLM responses for testing
 
 ## Future
-- [ ] Implement support for additional LLM providers
+- [ ] Support additional LLM providers
+- [ ] Add interactive mode for commit message editing
+- [ ] Implement support for multiple languages
+- [ ] Add performance optimizations for large diffs
