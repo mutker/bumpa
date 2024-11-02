@@ -42,13 +42,17 @@ func run() error {
 		return errors.Wrap(errors.CodeInitFailed, err)
 	}
 
-	if err := logger.Init(
-		loggingConfig.Environment,
-		loggingConfig.TimeFormat,
-		loggingConfig.Output,
-		loggingConfig.Level,
-		loggingConfig.Path,
-	); err != nil {
+	// Convert config to logger.Config
+	loggerCfg := logger.Config{
+		Environment: loggingConfig.Environment,
+		TimeFormat:  loggingConfig.TimeFormat,
+		Output:      loggingConfig.Output,
+		Level:       loggingConfig.Level,
+		Path:        loggingConfig.Path,
+		FilePerms:   loggingConfig.FilePerms,
+	}
+
+	if err := logger.Init(loggerCfg); err != nil {
 		return errors.Wrap(errors.CodeInitFailed, err)
 	}
 

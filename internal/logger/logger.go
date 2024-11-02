@@ -1,136 +1,142 @@
+//nolint:ireturn // Interfaces return needed for chaining
 package logger
 
 import (
 	"io"
 	"os"
 	"strings"
+	"time"
 
 	"codeberg.org/mutker/bumpa/internal/errors"
 	"github.com/rs/zerolog"
 )
 
-var logger zerolog.Logger
-
-type LogLevel int8
-
-const (
-	DebugLevel LogLevel = iota
-	InfoLevel
-	WarnLevel
-	ErrorLevel
-	FatalLevel
-	logFilePermissions = 0o666
-)
-
-func Init(environment, timeFormat, output, level, path string) error {
-	writer, err := getWriter(output, path)
-	if err != nil {
-		return err
-	}
-
-	consoleWriter := zerolog.ConsoleWriter{
-		Out:        writer,
-		TimeFormat: timeFormat,
-	}
-
-	logLevel := GetLogLevel(level)
-
-	zerolog.SetGlobalLevel(logLevel)
-	logger = zerolog.New(consoleWriter).With().
-		Timestamp().
-		Str("environment", environment).
-		Logger()
-
-	return nil
+// LogEvent represents a logging event that can be chained
+type LogEvent interface {
+	Str(key string, value string) LogEvent
+	Int(key string, value int) LogEvent
+	Bool(key string, value bool) LogEvent
+	Float64(key string, value float64) LogEvent
+	Err(err error) LogEvent
+	Interface(key string, value interface{}) LogEvent
+	Time(key string, value time.Time) LogEvent
+	Dur(key string, value time.Duration) LogEvent
+	Msg(msg string)
+	Msgf(format string, v ...interface{})
 }
 
-func SetLogger(l *zerolog.Logger) {
-	if l != nil {
-		logger = *l
+// Config holds logger configuration
+type Config struct {
+	Environment string
+	TimeFormat  string
+	Output      string
+	Level       string
+	Path        string
+	FilePerms   os.FileMode
+}
+
+var defaultLogger zerolog.Logger
+
+// zerologEvent adapts zerolog.Event to our LogEvent interface
+type zerologEvent struct {
+	event *zerolog.Event
+}
+
+func (e *zerologEvent) Str(key, value string) LogEvent {
+	e.event.Str(key, value)
+	return e
+}
+
+func (e *zerologEvent) Int(key string, value int) LogEvent {
+	e.event.Int(key, value)
+	return e
+}
+
+func (e *zerologEvent) Float64(key string, value float64) LogEvent {
+	e.event.Float64(key, value)
+	return e
+}
+
+func (e *zerologEvent) Bool(key string, value bool) LogEvent {
+	e.event.Bool(key, value)
+	return e
+}
+
+func (e *zerologEvent) Err(err error) LogEvent {
+	e.event.Err(err)
+	return e
+}
+
+func (e *zerologEvent) Interface(key string, value interface{}) LogEvent {
+	e.event.Interface(key, value)
+	return e
+}
+
+func (e *zerologEvent) Time(key string, value time.Time) LogEvent {
+	e.event.Time(key, value)
+	return e
+}
+
+func (e *zerologEvent) Dur(key string, value time.Duration) LogEvent {
+	e.event.Dur(key, value)
+	return e
+}
+
+func (e *zerologEvent) Msg(msg string) {
+	e.event.Msg(msg)
+}
+
+func (e *zerologEvent) Msgf(format string, v ...interface{}) {
+	e.event.Msgf(format, v...)
+}
+
+// Global functions for logging
+func Debug() LogEvent { return &zerologEvent{event: defaultLogger.Debug()} }
+func Info() LogEvent  { return &zerologEvent{event: defaultLogger.Info()} }
+func Warn() LogEvent  { return &zerologEvent{event: defaultLogger.Warn()} }
+func Error() LogEvent { return &zerologEvent{event: defaultLogger.Error()} }
+func Fatal() LogEvent { return &zerologEvent{event: defaultLogger.Fatal()} }
+
+// Init initializes the logger with the given configuration
+//
+//nolint:gocritic // Accepting value type for simpler API
+func Init(cfg Config) error {
+	if cfg.TimeFormat == "" {
+		cfg.TimeFormat = "2006-01-02T15:04:05Z07:00"
 	}
-}
 
-func GetLogger() zerolog.Logger {
-	return logger
-}
+	zerolog.TimeFieldFormat = cfg.TimeFormat
 
-func getWriter(output, path string) (io.Writer, error) {
-	if output == "file" && path != "" {
-		file, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, logFilePermissions)
+	var output io.Writer
+	if cfg.Output == "file" && cfg.Path != "" {
+		file, err := os.OpenFile(cfg.Path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, cfg.FilePerms)
 		if err != nil {
-			return nil, errors.Wrap(errors.CodeInitFailed, err)
+			return errors.WrapWithContext(
+				errors.CodeConfigError,
+				err,
+				errors.FormatContext(errors.ContextFileCreate, cfg.Path),
+			)
 		}
-
-		return file, nil
+		output = file
+	} else {
+		// Use console writer with colors for terminal output
+		output = zerolog.ConsoleWriter{
+			Out:        os.Stdout,
+			TimeFormat: cfg.TimeFormat,
+			NoColor:    false,
+		}
 	}
 
-	return os.Stdout, nil
-}
-
-func GetLogLevel(level string) zerolog.Level {
-	// zerolog levels are in reverse order (lower is more verbose):
-	// trace(-1) -> debug(0) -> info(1) -> warn(2) -> error(3) -> fatal(4) -> panic(5)
-	// Setting warn means "show warn and above (error, fatal)"
-	// Setting info means "show info and above (warn, error, fatal)"
-	switch strings.ToLower(level) {
-	case "trace":
-		return zerolog.TraceLevel // -1: most verbose
-	case "debug":
-		return zerolog.DebugLevel // 0: very verbose
-	case "info":
-		return zerolog.InfoLevel // 1: normal verbosity
-	case "warn":
-		return zerolog.WarnLevel // 2: warnings only
-	case "error":
-		return zerolog.ErrorLevel // 3: errors only
-	case "fatal":
-		return zerolog.FatalLevel // 4: fatal only
-	default:
-		return zerolog.InfoLevel // default to info
+	level, err := zerolog.ParseLevel(strings.ToLower(cfg.Level))
+	if err != nil {
+		return errors.WrapWithContext(
+			errors.CodeConfigError,
+			errors.ErrInvalidInput,
+			errors.ContextInvalidLogLevel,
+		)
 	}
-}
+	zerolog.SetGlobalLevel(level)
 
-func SetLogLevel(level LogLevel) {
-	zerolog.SetGlobalLevel(zerolog.Level(level))
-}
-
-// Debug logs a debug message
-func Debug() *zerolog.Event {
-	return logger.Debug()
-}
-
-func DebugWithComponent(component string) *zerolog.Event {
-	return logger.Debug().Str("component", component)
-}
-
-// Info logs an info message
-func Info() *zerolog.Event {
-	return logger.Info()
-}
-
-// Warn logs a warning message
-func Warn() *zerolog.Event {
-	return logger.Warn()
-}
-
-// Error logs an error message
-func Error() *zerolog.Event {
-	return logger.Error()
-}
-
-// ErrorWithCode logs an error message and returns a wrapped error
-func ErrorWithCode(code string, err error, msg string) error {
-	wrappedErr := errors.Wrap(code, err)
-	Error().
-		Str("error_code", code).
-		Str("error_message", msg).
-		AnErr("error", err).
-		Msg("An error occurred")
-
-	return wrappedErr
-}
-
-// Fatal logs a fatal message and exits the program
-func Fatal() *zerolog.Event {
-	return logger.Fatal()
+	defaultLogger = zerolog.New(output).With().Timestamp().Logger()
+	return nil
 }

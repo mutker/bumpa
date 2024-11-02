@@ -17,48 +17,66 @@ import (
 	"codeberg.org/mutker/bumpa/internal/logger"
 )
 
+// Core constants
 const (
 	ProviderOpenAICompatible = "openai-compatible"
 )
 
-// ChatRequest represents a chat completion request
+// Core Interfaces
+type Client interface {
+	GenerateText(ctx context.Context, systemPrompt, userPrompt string, tools []Tool) (string, error)
+}
+
+// Primary Client Structure
+type OpenAIClient struct {
+	url         string
+	token       string
+	model       string
+	client      *http.Client
+	rateLimiter *RateLimiter
+}
+
+// Request/Response structures
 type ChatRequest struct {
 	Model      string    `json:"model"`
 	Messages   []Message `json:"messages"`
 	Tools      []Tool    `json:"tools,omitempty"`
-	ToolChoice string    `json:"tool_choice,omitempty"` //nolint:tagliatelle // Matching API spec
+	ToolChoice string    `json:"tool_choice,omitempty"` //nolint:tagliatelle // Following OpenAI API spec
 }
 
-// Message represents a chat message
+type ChatResponse struct {
+	Choices []MessageChoice `json:"choices"`
+}
+
 type Message struct {
 	Role    string `json:"role"`
 	Content string `json:"content"`
 }
 
-// ChatResponse represents a chat completion response
-type ChatResponse struct {
-	// Common fields between OpenAI and Ollama
-	Choices []MessageChoice `json:"choices"`
-}
-
-// MessageResponse represents the assistant's response
 type MessageResponse struct {
 	Content   string     `json:"content"`
 	ToolCalls []ToolCall `json:"tool_calls,omitempty"` //nolint:tagliatelle // Matching API spec
 }
 
-// MessageChoice represents a single choice in the response
 type MessageChoice struct {
 	Message MessageResponse `json:"message"`
 	Index   int             `json:"index"`
 }
 
 // Tool-related structures
-type ToolCall struct {
-	Function struct {
-		Name      string `json:"name"`
-		Arguments string `json:"arguments"`
-	} `json:"function"`
+type Tool struct {
+	Type     string   `json:"type"`
+	Function Function `json:"function"`
+	//nolint:tagliatelle // Maintaining API spec naming
+	SystemPrompt string `mapstructure:"system_prompt" yaml:"system_prompt"`
+	//nolint:tagliatelle // Maintaining API spec naming
+	UserPrompt string `mapstructure:"user_prompt" yaml:"user_prompt"`
+}
+
+type Function struct {
+	Name        string     `json:"name"`
+	Description string     `json:"description"`
+	Parameters  Parameters `json:"parameters"`
 }
 
 type Parameters struct {
@@ -73,14 +91,11 @@ type Property struct {
 	Enum        []string `json:"enum,omitempty" yaml:"enum,omitempty"`
 }
 
-// Tool represents a function that can be called by the model
-//
-//nolint:tagliatelle // Maintaining consistent naming convention
-type Tool struct {
-	Type         string   `json:"type"` // Always "function"
-	Function     Function `json:"function"`
-	SystemPrompt string   `mapstructure:"system_prompt" yaml:"system_prompt"`
-	UserPrompt   string   `mapstructure:"user_prompt"   yaml:"user_prompt"`
+type ToolCall struct {
+	Function struct {
+		Name      string `json:"name"`
+		Arguments string `json:"arguments"`
+	} `json:"function"`
 }
 
 type ToolCallArguments struct {
@@ -91,29 +106,6 @@ type ToolCallArguments struct {
 	Summary               string `json:"summary"`
 }
 
-// Function represents the function definition for a tool
-type Function struct {
-	Name        string     `json:"name"`
-	Description string     `json:"description"`
-	Parameters  Parameters `json:"parameters"`
-}
-
-// Client interface defines the LLM client behavior
-type Client interface {
-	GenerateText(ctx context.Context, systemPrompt, userPrompt string, tools []Tool) (string, error)
-}
-
-// OpenAIClient implements OpenAI-compatible API client (works for both OpenAI and Ollama)
-type OpenAIClient struct {
-	url         string
-	token       string // Optional for Ollama
-	model       string
-	client      *http.Client
-	rateLimiter *RateLimiter
-}
-
-// New creates a new OpenAIClient
-//
 //nolint:ireturn // Interface return needed for provider flexibility and testing
 func New(cfg *config.LLMConfig) (Client, error) {
 	logger.Debug().
@@ -123,14 +115,14 @@ func New(cfg *config.LLMConfig) (Client, error) {
 		Msg("Initializing LLM client")
 
 	if err := validateConfig(cfg); err != nil {
-		return nil, errors.WrapWithContext(errors.CodeConfigError, err, "invalid LLM configuration")
+		return nil, err
 	}
 
 	if cfg.Provider != ProviderOpenAICompatible {
 		return nil, errors.WrapWithContext(
 			errors.CodeConfigError,
 			errors.ErrInvalidConfig,
-			fmt.Sprintf("provider must be openai-compatible (got: %s)", cfg.Provider),
+			errors.FormatContext("provider must be openai-compatible (got: %s)", cfg.Provider),
 		)
 	}
 
@@ -146,7 +138,11 @@ func New(cfg *config.LLMConfig) (Client, error) {
 func (c *OpenAIClient) GenerateText(ctx context.Context, systemPrompt, userPrompt string, tools []Tool) (string, error) {
 	select {
 	case <-ctx.Done():
-		return "", errors.Wrap(errors.CodeTimeoutError, ctx.Err())
+		return "", errors.WrapWithContext(
+			errors.CodeTimeoutError,
+			ctx.Err(),
+			errors.ContextLLMTimeout,
+		)
 	default:
 		messages := []Message{
 			{Role: "system", Content: systemPrompt},
@@ -160,7 +156,13 @@ func (c *OpenAIClient) GenerateText(ctx context.Context, systemPrompt, userPromp
 			ToolChoice: "auto",
 		}
 
-		requestJSON, err := json.Marshal(request) //nolint:musttag // ChatRequest is properly tagged with json
+		logger.Debug().
+			Int("message_count", len(messages)).
+			Int("tool_count", len(tools)).
+			Str("model", c.model).
+			Msg("Preparing LLM request")
+
+		requestJSON, err := json.Marshal(&request) //nolint:musttag // ChatRequest is properly tagged with json
 		if err != nil {
 			return "", errors.WrapWithContext(
 				errors.CodeLLMError,
@@ -171,16 +173,12 @@ func (c *OpenAIClient) GenerateText(ctx context.Context, systemPrompt, userPromp
 
 		resp, err := c.makeRequest(ctx, requestJSON)
 		if err != nil {
-			return "", err // Already wrapped
+			return "", err
 		}
 
 		content, err := extractContent(resp)
 		if err != nil {
-			return "", errors.WrapWithContext(
-				errors.CodeLLMError,
-				err,
-				"failed to extract content from response",
-			)
+			return "", err
 		}
 
 		return content, nil
@@ -189,14 +187,19 @@ func (c *OpenAIClient) GenerateText(ctx context.Context, systemPrompt, userPromp
 
 func (c *OpenAIClient) makeRequest(ctx context.Context, requestJSON []byte) (*ChatResponse, error) {
 	estimatedTokens := EstimateTokens(requestJSON)
-	c.rateLimiter.WaitForCapacity(estimatedTokens)
+	logger.Info().Msgf("Estimated token usage for request: %d", estimatedTokens)
+
+	c.rateLimiter.WaitForCapacity()
 
 	endpoint := strings.TrimSuffix(c.url, "/") + "/chat/completions"
-
 	for {
 		req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewBuffer(requestJSON))
 		if err != nil {
-			return nil, errors.WrapWithContext(errors.CodeLLMError, err, "failed to create request")
+			return nil, errors.WrapWithContext(
+				errors.CodeLLMError,
+				err,
+				errors.ContextLLMRequest,
+			)
 		}
 
 		req.Header.Set("Content-Type", "application/json")
@@ -206,10 +209,13 @@ func (c *OpenAIClient) makeRequest(ctx context.Context, requestJSON []byte) (*Ch
 
 		resp, err := c.client.Do(req)
 		if err != nil {
-			return nil, errors.WrapWithContext(errors.CodeLLMError, err, "failed to make request")
+			return nil, errors.WrapWithContext(
+				errors.CodeLLMError,
+				err,
+				errors.ContextLLMRequest,
+			)
 		}
 
-		// Parse rate limit headers
 		rateLimitInfo, err := parseRateLimitHeaders(resp.Header)
 		if err != nil {
 			resp.Body.Close()
@@ -218,18 +224,26 @@ func (c *OpenAIClient) makeRequest(ctx context.Context, requestJSON []byte) (*Ch
 			c.rateLimiter.UpdateLimits(rateLimitInfo)
 		}
 
-		// Handle 429 Too Many Requests
 		if resp.StatusCode == http.StatusTooManyRequests {
 			resp.Body.Close()
-			retryDuration := defaultRetryDuration
+
+			// Log current status and wait time
+			waitTime := defaultRetryDuration
 			if rateLimitInfo.RetryAfter > 0 {
-				retryDuration = rateLimitInfo.RetryAfter
+				waitTime = rateLimitInfo.RetryAfter
 			}
-			HandleRetryAfter(retryDuration)
+
+			logger.Debug().
+				Int("estimated_tokens", estimatedTokens).
+				Int("remaining_tokens", rateLimitInfo.RemainingTokens).
+				Float64("wait_time_seconds", waitTime.Seconds()).
+				Time("reset_at", time.Now().Add(waitTime)).
+				Msg("Rate limit reached, waiting before retry")
+
+			time.Sleep(waitTime)
 			continue
 		}
 
-		// Handle other response cases
 		if resp.StatusCode != http.StatusOK {
 			body, _ := io.ReadAll(resp.Body)
 			resp.Body.Close()
@@ -243,79 +257,26 @@ func (c *OpenAIClient) makeRequest(ctx context.Context, requestJSON []byte) (*Ch
 		var result ChatResponse
 		if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
 			resp.Body.Close()
-			return nil, errors.WrapWithContext(errors.CodeLLMError, err, "failed to decode response")
+			return nil, errors.WrapWithContext(
+				errors.CodeLLMError,
+				err,
+				errors.ContextLLMResponse,
+			)
 		}
 		resp.Body.Close()
 		return &result, nil
 	}
 }
 
-// EstimateTokens estimates the number of tokens in a JSON request
-func EstimateTokens(requestJSON []byte) int {
-	return len(requestJSON) / tokenSizeMultiplier
-}
-
-// parseRateLimitHeaders parses rate limit information from response headers
-func parseRateLimitHeaders(headers http.Header) (RateLimitInfo, error) {
-	info := RateLimitInfo{}
-	var parseErr error
-
-	// Helper function to parse integers from headers
-	parseIntHeader := func(header string) (int, error) {
-		val := headers.Get(header)
-		if val == "" {
-			return 0, nil
-		}
-		return strconv.Atoi(val)
-	}
-
-	// Helper function to parse durations from headers
-	parseDurationHeader := func(header string) (time.Duration, error) {
-		val := headers.Get(header)
-		if val == "" {
-			return 0, nil
-		}
-		return time.ParseDuration(val)
-	}
-
-	// Parse remaining tokens and requests
-	if info.RemainingTokens, parseErr = parseIntHeader(headerRemainingTokens); parseErr != nil {
-		return info, errors.WrapWithContext(errors.CodeLLMError, parseErr, "invalid remaining tokens header")
-	}
-
-	if info.RemainingRequests, parseErr = parseIntHeader(headerRemainingRequests); parseErr != nil {
-		return info, errors.WrapWithContext(errors.CodeLLMError, parseErr, "invalid remaining requests header")
-	}
-
-	// Parse reset durations
-	if info.TokensResetIn, parseErr = parseDurationHeader(headerResetTokens); parseErr != nil {
-		return info, errors.WrapWithContext(errors.CodeLLMError, parseErr, "invalid tokens reset header")
-	}
-
-	if info.RequestsResetIn, parseErr = parseDurationHeader(headerResetRequests); parseErr != nil {
-		return info, errors.WrapWithContext(errors.CodeLLMError, parseErr, "invalid requests reset header")
-	}
-
-	// Parse retry-after
-	if retryAfter := headers.Get(headerRetryAfter); retryAfter != "" { //nolint:canonicalheader // Using lowercase as per API spec
-		seconds, err := strconv.Atoi(retryAfter)
-		if err != nil {
-			return info, errors.WrapWithContext(errors.CodeLLMError, err, "invalid retry-after header")
-		}
-		info.RetryAfter = time.Duration(seconds) * time.Second
-	}
-
-	return info, nil
-}
-
-// CallTool generates text using the LLM client with tool-specific formatting
-//
-//nolint:cyclop // Complex function handling tool calls and responses
+// Tool-related functions
 func CallTool(ctx context.Context, client Client, tool *config.Tool, input interface{}) (string, error) {
-	// Create base log event
-	logEvent := logger.Info().Str("tool", tool.Name)
+	startTime := time.Now()
 
-	// Try to extract filename for info message if it exists
+	logEvent := logger.Info().
+		Str("model", tool.Model).
+		Int("system_prompt_length", len(tool.SystemPrompt)).
+		Int("user_prompt_length", len(tool.UserPrompt))
+
 	if inputMap, ok := input.(map[string]interface{}); ok {
 		if file, exists := inputMap["file"]; exists {
 			if filename, ok := file.(string); ok {
@@ -323,29 +284,86 @@ func CallTool(ctx context.Context, client Client, tool *config.Tool, input inter
 			}
 		}
 	}
-	logEvent.Msg("Calling LLM tool")
-
-	logger.Debug().
-		Str("tool", tool.Name).
-		Interface("input", input).
-		Msg("Tool input details")
+	logEvent.Msg("Calling LLM tool: " + tool.Name)
 
 	if err := validateToolConfig(tool); err != nil {
 		return "", err
 	}
 
-	// Convert config.Property to llm.Property
-	properties := make(map[string]Property)
-	for k, v := range tool.Function.Parameters.Properties {
-		properties[k] = Property{
-			Type:        v.Type,
-			Description: v.Description,
-			Enum:        v.Enum,
-		}
+	properties := convertProperties(tool.Function.Parameters.Properties)
+	toolDef := createToolDefinition(tool, properties)
+
+	if err := validateTool(&toolDef); err != nil {
+		return "", err
 	}
 
-	// Create tool definition
-	toolDef := Tool{
+	userPrompt, err := executeTemplate("user_prompt", tool.UserPrompt, input)
+	if err != nil {
+		return "", errors.WrapWithContext(
+			errors.CodeTemplateError,
+			err,
+			"failed to execute user prompt template",
+		)
+	}
+
+	response, err := client.GenerateText(ctx, tool.SystemPrompt, userPrompt, []Tool{toolDef})
+	if err != nil {
+		logger.Warn().
+			Err(err).
+			Str("tool", tool.Name).
+			Msg("LLM call failed")
+		return "", err
+	}
+
+	response = processToolResponse(response, tool.Name)
+	if response == "" {
+		return "", errors.WrapWithContext(
+			errors.CodeLLMError,
+			errors.ErrInvalidInput,
+			errors.ContextLLMEmptyResponse,
+		)
+	}
+
+	logger.Debug().
+		Str("tool", tool.Name).
+		Int("response_length", len(response)).
+		Dur("duration", time.Since(startTime)).
+		Msg("LLM tool execution completed")
+
+	return response, nil
+}
+
+func processToolResponse(response, toolName string) string {
+	if strings.HasPrefix(response, "{") && strings.HasSuffix(response, "}") {
+		var toolResponse struct {
+			Summary string `json:"summary"`
+			Message string `json:"message"`
+			Content string `json:"content"`
+		}
+
+		if err := json.Unmarshal([]byte(response), &toolResponse); err == nil {
+			if toolResponse.Summary != "" {
+				return toolResponse.Summary
+			}
+			if toolResponse.Message != "" {
+				return toolResponse.Message
+			}
+			if toolResponse.Content != "" {
+				return toolResponse.Content
+			}
+		}
+
+		logger.Debug().
+			Str("tool_name", toolName).
+			Str("response", response).
+			Msg("Received JSON response but couldn't extract expected fields")
+	}
+
+	return cleanResponse(response)
+}
+
+func createToolDefinition(tool *config.Tool, properties map[string]Property) Tool {
+	return Tool{
 		Type: "function",
 		Function: Function{
 			Name:        tool.Function.Name,
@@ -357,159 +375,41 @@ func CallTool(ctx context.Context, client Client, tool *config.Tool, input inter
 			},
 		},
 	}
-
-	if err := validateTool(&toolDef); err != nil {
-		return "", errors.WrapWithContext(
-			errors.CodeConfigError,
-			err,
-			"invalid tool configuration",
-		)
-	}
-
-	tools := []Tool{toolDef}
-
-	// Execute template with input data
-	userPrompt, err := executeTemplate("user_prompt", tool.UserPrompt, input)
-	if err != nil {
-		return "", errors.Wrap(errors.CodeTemplateError, err)
-	}
-
-	logger.Debug().
-		Str("tool_name", tool.Name).
-		Str("system_prompt", tool.SystemPrompt).
-		Str("user_prompt", userPrompt).
-		Interface("input", input).
-		Msg("Executing tool with prompts")
-
-	// Make the LLM call
-	response, err := client.GenerateText(ctx, tool.SystemPrompt, userPrompt, tools)
-	if err != nil {
-		logger.Warn().
-			Err(err).
-			Str("tool", tool.Name).
-			Msg("LLM call failed")
-		return "", err
-	}
-
-	logger.Debug().
-		Str("tool", tool.Name).
-		Str("response", response).
-		Msg("Received LLM response")
-
-	// Try to parse as tool call response first
-	if strings.HasPrefix(response, "{") && strings.HasSuffix(response, "}") {
-		var toolResponse struct {
-			Summary string `json:"summary"`
-			Message string `json:"message"`
-			Content string `json:"content"`
-		}
-
-		if err := json.Unmarshal([]byte(response), &toolResponse); err == nil {
-			// Try summary first, then message, then content
-			if toolResponse.Summary != "" {
-				return toolResponse.Summary, nil
-			}
-			if toolResponse.Message != "" {
-				return toolResponse.Message, nil
-			}
-			if toolResponse.Content != "" {
-				return toolResponse.Content, nil
-			}
-		}
-
-		logger.Debug().
-			Str("tool_name", tool.Name).
-			Str("response", response).
-			Msg("Received JSON response but couldn't extract expected fields")
-	}
-
-	// Clean and validate the response
-	response = cleanResponse(response)
-	if response == "" {
-		return "", errors.WrapWithContext(
-			errors.CodeLLMError,
-			errors.ErrInvalidInput,
-			"empty response from tool",
-		)
-	}
-
-	return response, nil
 }
 
-func extractContent(resp *ChatResponse) (string, error) {
-	if resp == nil {
-		return "", errors.Wrap(errors.CodeLLMError, errors.ErrInvalidInput)
-	}
-
-	// Check for valid response
-	if len(resp.Choices) == 0 {
-		return "", errors.WrapWithContext(
-			errors.CodeLLMError,
-			errors.ErrInvalidInput,
-			"no choices in response",
-		)
-	}
-
-	// Get the first choice
-	choice := resp.Choices[0]
-
-	// Check for tool calls first
-	if len(choice.Message.ToolCalls) > 0 {
-		toolCall := choice.Message.ToolCalls[0]
-		if toolCall.Function.Arguments != "" {
-			return toolCall.Function.Arguments, nil
-		}
-	}
-
-	// Fall back to content
-	if choice.Message.Content != "" {
-		return choice.Message.Content, nil
-	}
-
-	return "", errors.WrapWithContext(
-		errors.CodeLLMError,
-		errors.ErrInvalidInput,
-		"no content found in response",
-	)
-}
-
-// Helper function to clean tool responses
-func cleanResponse(response string) string {
-	// Remove any markdown formatting
-	response = strings.ReplaceAll(response, "`", "")
-	response = strings.TrimSpace(response)
-
-	// Remove common LLM prefixes
-	prefixes := []string{
-		"Here's a summary:",
-		"Summary:",
-		"Response:",
-		"Result:",
-	}
-	for _, prefix := range prefixes {
-		response = strings.TrimPrefix(response, prefix)
-	}
-
-	return strings.TrimSpace(response)
-}
-
+// Validation functions
 func validateConfig(cfg *config.LLMConfig) error {
 	if cfg == nil {
-		return errors.New("LLM configuration is required")
+		return errors.WrapWithContext(
+			errors.CodeConfigError,
+			errors.ErrInvalidInput,
+			"LLM configuration is required",
+		)
 	}
 	if cfg.Provider != ProviderOpenAICompatible {
-		return errors.New("Provider must be openai-compatible")
+		return errors.WrapWithContext(
+			errors.CodeConfigError,
+			errors.ErrInvalidConfig,
+			"provider must be openai-compatible",
+		)
 	}
 	if cfg.BaseURL == "" {
-		return errors.New("BaseURL is required")
+		return errors.WrapWithContext(
+			errors.CodeConfigError,
+			errors.ErrInvalidInput,
+			"BaseURL is required",
+		)
 	}
 	if cfg.Model == "" {
-		return errors.New("Model is required")
+		return errors.WrapWithContext(
+			errors.CodeConfigError,
+			errors.ErrInvalidInput,
+			"Model is required",
+		)
 	}
 	return nil
 }
 
-// Helper function to validate tool configuration
 func validateTool(tool *Tool) error {
 	if tool.Type != "function" {
 		return errors.New(errors.CodeConfigError)
@@ -590,15 +490,182 @@ func validateToolConfig(tool *config.Tool) error {
 	return nil
 }
 
+// Helper functions
+func convertProperties(configProps map[string]config.Property) map[string]Property {
+	properties := make(map[string]Property)
+	for k, v := range configProps {
+		properties[k] = Property{
+			Type:        v.Type,
+			Description: v.Description,
+			Enum:        v.Enum,
+		}
+	}
+	return properties
+}
+
+func cleanResponse(response string) string {
+	originalLength := len(response)
+
+	response = strings.ReplaceAll(response, "`", "")
+	response = strings.TrimSpace(response)
+
+	prefixes := []string{
+		"Here's a summary:",
+		"Summary:",
+		"Response:",
+		"Result:",
+	}
+	for _, prefix := range prefixes {
+		response = strings.TrimPrefix(response, prefix)
+	}
+
+	if len(response) != originalLength {
+		logger.Debug().
+			Int("original_length", originalLength).
+			Int("cleaned_length", len(response)).
+			Msg("Cleaned LLM response")
+	}
+
+	return strings.TrimSpace(response)
+}
+
+func extractContent(resp *ChatResponse) (string, error) {
+	if resp == nil {
+		return "", errors.WrapWithContext(
+			errors.CodeLLMError,
+			errors.ErrInvalidInput,
+			errors.ContextLLMInvalidResponse,
+		)
+	}
+
+	if len(resp.Choices) == 0 {
+		return "", errors.WrapWithContext(
+			errors.CodeLLMError,
+			errors.ErrInvalidInput,
+			errors.ContextLLMNoChoices,
+		)
+	}
+
+	choice := resp.Choices[0]
+
+	logger.Debug().
+		Int("choice_index", choice.Index).
+		Int("tool_calls_count", len(choice.Message.ToolCalls)).
+		Bool("has_content", choice.Message.Content != "").
+		Msg("Processing LLM response")
+
+	if len(choice.Message.ToolCalls) > 0 {
+		toolCall := choice.Message.ToolCalls[0]
+		if toolCall.Function.Arguments != "" {
+			return toolCall.Function.Arguments, nil
+		}
+	}
+
+	if choice.Message.Content != "" {
+		return choice.Message.Content, nil
+	}
+
+	return "", errors.WrapWithContext(
+		errors.CodeLLMError,
+		errors.ErrInvalidInput,
+		errors.ContextLLMEmptyResponse,
+	)
+}
+
+func EstimateTokens(requestJSON []byte) int {
+	return len(requestJSON) / tokenSizeMultiplier
+}
+
+func parseRateLimitHeaders(headers http.Header) (RateLimitInfo, error) {
+	info := RateLimitInfo{}
+	var parseErr error
+
+	// Helper function to parse integers from headers
+	parseIntHeader := func(header string) (int, error) {
+		val := headers.Get(header)
+		if val == "" {
+			return 0, nil
+		}
+		return strconv.Atoi(val)
+	}
+
+	// Helper function to parse durations from headers
+	parseDurationHeader := func(header string) (time.Duration, error) {
+		val := headers.Get(header)
+		if val == "" {
+			return 0, nil
+		}
+		return time.ParseDuration(val)
+	}
+
+	// Parse remaining tokens and requests
+	if info.RemainingTokens, parseErr = parseIntHeader(headerRemainingTokens); parseErr != nil {
+		return info, errors.WrapWithContext(
+			errors.CodeLLMError,
+			parseErr,
+			"invalid remaining tokens header",
+		)
+	}
+
+	if info.RemainingRequests, parseErr = parseIntHeader(headerRemainingRequests); parseErr != nil {
+		return info, errors.WrapWithContext(
+			errors.CodeLLMError,
+			parseErr,
+			"invalid remaining requests header",
+		)
+	}
+
+	// Parse reset durations
+	if info.TokensResetIn, parseErr = parseDurationHeader(headerResetTokens); parseErr != nil {
+		return info, errors.WrapWithContext(
+			errors.CodeLLMError,
+			parseErr,
+			"invalid tokens reset header",
+		)
+	}
+
+	if info.RequestsResetIn, parseErr = parseDurationHeader(headerResetRequests); parseErr != nil {
+		return info, errors.WrapWithContext(
+			errors.CodeLLMError,
+			parseErr,
+			"invalid requests reset header",
+		)
+	}
+
+	// Parse retry-after
+	//nolint:canonicalheader // Using lowercase as per API spec
+	if retryAfter := headers.Get(headerRetryAfter); retryAfter != "" {
+		seconds, err := strconv.Atoi(retryAfter)
+		if err != nil {
+			return info, errors.WrapWithContext(
+				errors.CodeLLMError,
+				err,
+				"invalid retry-after header",
+			)
+		}
+		info.RetryAfter = time.Duration(seconds) * time.Second
+	}
+
+	return info, nil
+}
+
 func executeTemplate(name, text string, data interface{}) (string, error) {
 	tmpl, err := template.New(name).Parse(text)
 	if err != nil {
-		return "", err
+		return "", errors.WrapWithContext(
+			errors.CodeTemplateError,
+			err,
+			"failed to parse template",
+		)
 	}
 
 	var buf strings.Builder
 	if err := tmpl.Execute(&buf, data); err != nil {
-		return "", err
+		return "", errors.WrapWithContext(
+			errors.CodeTemplateError,
+			err,
+			"failed to execute template",
+		)
 	}
 
 	return buf.String(), nil

@@ -4,6 +4,7 @@ import (
 	"sync"
 	"time"
 
+	"codeberg.org/mutker/bumpa/internal/errors"
 	"codeberg.org/mutker/bumpa/internal/logger"
 )
 
@@ -17,7 +18,6 @@ const (
 )
 
 const (
-	// Default values
 	defaultRetryDuration = 5 * time.Second
 	tokenSizeMultiplier  = 4 // Approximate bytes-to-tokens ratio
 )
@@ -47,6 +47,14 @@ type RateLimitInfo struct {
 	RetryAfter        time.Duration // Only set when receiving 429
 }
 
+// WaitInfo contains information about why we're waiting
+type WaitInfo struct {
+	NeedsToWait     bool
+	RemainingTokens int
+	WaitTime        time.Duration
+	ResetAt         time.Time
+}
+
 // NewRateLimiter creates a new rate limiter instance
 func NewRateLimiter() *RateLimiter {
 	return &RateLimiter{
@@ -69,59 +77,27 @@ func (rl *RateLimiter) UpdateLimits(info RateLimitInfo) {
 
 	rl.remainingRequests = info.RemainingRequests
 	rl.requestsResetAt = now.Add(info.RequestsResetIn)
-
-	logger.Debug().
-		Int("remaining_tokens", info.RemainingTokens).
-		Dur("tokens_reset_in", info.TokensResetIn).
-		Int("remaining_requests", info.RemainingRequests).
-		Dur("requests_reset_in", info.RequestsResetIn).
-		Msg("Updated rate limits")
 }
 
 // WaitForCapacity waits until there's capacity to make a request
-func (rl *RateLimiter) WaitForCapacity(estimatedTokens int) {
+func (rl *RateLimiter) WaitForCapacity() {
 	rl.mu.Lock()
 	defer rl.mu.Unlock()
 
-	// If limits aren't initialized yet, don't wait
-	if rl.remainingTokens < 0 || rl.remainingRequests < 0 {
-		return
-	}
-
-	now := time.Now()
-
-	// Check and wait for token capacity
-	if now.Before(rl.tokensResetAt) && rl.remainingTokens < estimatedTokens {
-		waitTime := rl.tokensResetAt.Sub(now)
+	if rl.remainingTokens >= 0 {
 		logger.Debug().
-			Dur("wait_time", waitTime).
 			Int("remaining_tokens", rl.remainingTokens).
-			Int("estimated_tokens", estimatedTokens).
-			Msg("Waiting for token capacity")
-
-		rl.mu.Unlock()
-		time.Sleep(waitTime)
-		rl.mu.Lock()
-	}
-
-	// Check and wait for request capacity
-	if now.Before(rl.requestsResetAt) && rl.remainingRequests < 1 {
-		waitTime := rl.requestsResetAt.Sub(now)
-		logger.Debug().
-			Dur("wait_time", waitTime).
 			Int("remaining_requests", rl.remainingRequests).
-			Msg("Waiting for request capacity")
-
-		rl.mu.Unlock()
-		time.Sleep(waitTime)
-		rl.mu.Lock()
+			Time("tokens_reset_at", rl.tokensResetAt).
+			Time("requests_reset_at", rl.requestsResetAt).
+			Msg("Current rate limit status")
 	}
 }
 
 // HandleRetryAfter handles 429 responses by waiting for the specified duration
 func HandleRetryAfter(retryAfter time.Duration) {
 	logger.Debug().
-		Dur("retry_after", retryAfter).
-		Msg("Rate limit exceeded, waiting before retry")
+		Float64("retry_after_seconds", retryAfter.Seconds()).
+		Msg(errors.ContextLLMRateLimit)
 	time.Sleep(retryAfter)
 }
