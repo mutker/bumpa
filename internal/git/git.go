@@ -4,7 +4,6 @@ package git
 import (
 	"context"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"time"
@@ -274,7 +273,25 @@ func (r *Repository) GetFilesToCommit() ([]string, error) {
 //
 //nolint:nonamedreturns // Using named returns for clarity as recommended by gocritic
 func (r *Repository) getUserConfig() (name, email string, err error) {
-	// Get repository config
+	// With includeIf support, we should first try to get the effective config values
+	// directly from git, letting it handle all the config resolution
+	if isGitAvailable() {
+		name, err = getConfigValue("", "user.name")
+		if err != nil {
+			return "", "", err
+		}
+
+		email, err = getConfigValue("", "user.email")
+		if err != nil {
+			return "", "", err
+		}
+
+		if name != "" && email != "" {
+			return name, email, nil
+		}
+	}
+
+	// Fall back to repo config only if git isn't available or values weren't found
 	cfg, err := r.repo.Config()
 	if err != nil {
 		return "", "", errors.WrapWithContext(
@@ -284,16 +301,11 @@ func (r *Repository) getUserConfig() (name, email string, err error) {
 		)
 	}
 
-	// Try repo config first
-	name = cfg.User.Name
-	email = cfg.User.Email
-
-	// Fall back to global config if needed
 	if name == "" {
-		name = getGlobalConfig("user.name")
+		name = cfg.User.Name
 	}
 	if email == "" {
-		email = getGlobalConfig("user.email")
+		email = cfg.User.Email
 	}
 
 	// Validate user information
@@ -301,21 +313,11 @@ func (r *Repository) getUserConfig() (name, email string, err error) {
 		return "", "", errors.WrapWithContext(
 			errors.CodeGitError,
 			errors.ErrInvalidInput,
-			errors.ContextGitUserNotConfigured,
+			"git user not configured - ensure your git config includes appropriate user settings",
 		)
 	}
 
 	return name, email, nil
-}
-
-// getGlobalConfig returns the value of a global git config key
-func getGlobalConfig(key string) string {
-	cmd := exec.Command("git", "config", "--global", key)
-	output, err := cmd.Output()
-	if err != nil {
-		return ""
-	}
-	return strings.TrimSpace(string(output))
 }
 
 // stageFiles stages the given files in the worktree

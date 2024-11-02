@@ -272,10 +272,14 @@ func (c *OpenAIClient) makeRequest(ctx context.Context, requestJSON []byte) (*Ch
 func CallTool(ctx context.Context, client Client, tool *config.Tool, input interface{}) (string, error) {
 	startTime := time.Now()
 
+	// Get the actual model being used
+	var model string
+	if openAIClient, ok := client.(*OpenAIClient); ok {
+		model = openAIClient.model
+	}
+
 	logEvent := logger.Info().
-		Str("model", tool.Model).
-		Int("system_prompt_length", len(tool.SystemPrompt)).
-		Int("user_prompt_length", len(tool.UserPrompt))
+		Str("model", model)
 
 	if inputMap, ok := input.(map[string]interface{}); ok {
 		if file, exists := inputMap["file"]; exists {

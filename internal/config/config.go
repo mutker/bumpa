@@ -36,6 +36,13 @@ type Config struct {
 	Command string
 }
 
+type GitConfig struct {
+	IncludeGitignore    bool     `mapstructure:"include_gitignore"`
+	Ignore              []string `mapstructure:"ignore"`
+	MaxDiffLines        int      `mapstructure:"max_diff_lines"`
+	PreferredLineLength int      `mapstructure:"preferredLineLength"`
+}
+
 type CLIConfig struct {
 	Command string
 }
@@ -60,13 +67,6 @@ type EnvironmentConfig struct {
 	Path       string      `mapstructure:"file_path,omitempty"`
 	FilePerms  os.FileMode `mapstructure:"file_perms,omitempty"`
 	DirPerms   os.FileMode `mapstructure:"dir_perms,omitempty"`
-}
-
-type GitConfig struct {
-	IncludeGitignore    bool     `mapstructure:"include_gitignore"`
-	Ignore              []string `mapstructure:"ignore"`
-	MaxDiffLines        int      `mapstructure:"max_diff_lines"`
-	PreferredLineLength int      `mapstructure:"preferredLineLength"`
 }
 
 type LLMConfig struct {

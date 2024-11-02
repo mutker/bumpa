@@ -73,13 +73,15 @@ const (
 	ContextNoChanges            = "no changes staged for commit - use 'git add' to stage files"
 	ContextGitUserNotConfigured = "git user not configured - run: git config --global user.name '<name>' " +
 		"&& git config --global user.email '<email>'"
-	ContextGitRepoOpen = "failed to open git repository"
-	ContextGitWorkTree = "failed to get git worktree"
-	ContextGitStatus   = "failed to get git status"
-	ContextGitCommit   = "failed to create git commit"
-	ContextGitBranch   = "failed to get current branch"
-	ContextGitDiff     = "failed to get file diff"
-	ContextGitIgnore   = "failed to read gitignore patterns"
+	ContextGitRepoOpen          = "failed to open git repository"
+	ContextGitWorkTree          = "failed to get git worktree"
+	ContextGitStatus            = "failed to get git status"
+	ContextGitCommit            = "failed to create git commit"
+	ContextGitBranch            = "failed to get current branch"
+	ContextGitDiff              = "failed to get file diff"
+	ContextGitIgnore            = "failed to read gitignore patterns"
+	ContextGitConfigInvalidMode = "invalid git config mode"
+	ContextGitConfigReadError   = "failed to read git config"
 
 	// LLM contexts
 	ContextLLMRequest         = "failed to make LLM request"
