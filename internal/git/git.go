@@ -271,7 +271,7 @@ func (r *Repository) GetFilesToCommit() ([]string, error) {
 
 // getUserConfig returns the user's name and email from git config.
 //
-//nolint:nonamedreturns // Using named returns for clarity as recommended by gocritic
+//nolint:nonamedreturns,cyclop // Using named returns for clarity as recommended by gocritic
 func (r *Repository) getUserConfig() (name, email string, err error) {
 	// With includeIf support, we should first try to get the effective config values
 	// directly from git, letting it handle all the config resolution
