@@ -32,6 +32,8 @@
 
 ## Git
 - [ ] Create prepare-commit-msg hook
+- [x] Support GPG commit signing
+- [x] Add proper git config handling (includeIf support)
 - [x] Implement git diff analysis
 - [x] Add support for gitignore patterns
 
