@@ -145,6 +145,65 @@ func TestEnvironmentConfigValidation(t *testing.T) {
 	}
 }
 
+func TestEnvironmentVariableOverrides(t *testing.T) {
+	tests := []struct {
+		name     string
+		envVars  map[string]string
+		validate func(*config.Config) bool
+	}{
+		{
+			name: "Debug Mode",
+			envVars: map[string]string{
+				"BUMPA_DEBUG": "true",
+			},
+			validate: func(cfg *config.Config) bool {
+				return cfg.Logging.Level == "debug"
+			},
+		},
+		{
+			name: "Custom Log Level",
+			envVars: map[string]string{
+				"BUMPA_LOG_LEVEL": "warn",
+			},
+			validate: func(cfg *config.Config) bool {
+				return cfg.Logging.Level == "warn"
+			},
+		},
+		{
+			name: "Custom Environment",
+			envVars: map[string]string{
+				"BUMPA_ENVIRONMENT": "production",
+			},
+			validate: func(cfg *config.Config) bool {
+				return cfg.Logging.Environment == "production"
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Reset environment
+			os.Clearenv()
+
+			// Set test environment variables
+			for k, v := range tt.envVars {
+				t.Setenv(k, v)
+			}
+
+			// Load config
+			cfg, err := config.Load()
+			if err != nil {
+				t.Fatalf("Load() error = %v", err)
+			}
+
+			// Validate result
+			if !tt.validate(cfg) {
+				t.Errorf("Configuration not properly overridden by environment variables")
+			}
+		})
+	}
+}
+
 // Add helper function to check log levels
 func IsValidLogLevel(level string) bool {
 	switch strings.ToLower(level) {

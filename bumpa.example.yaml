@@ -31,7 +31,26 @@ git:
   max_diff_lines: 10
   preferred_line_length: 72 # Standard git commit message length
 
-tools:
+version:
+  git:
+    commit: false # Whether to create version bump commits
+    tag: true # Whether to create version tags
+    signage: true # Whether to sign git tags
+  files: # Files to update with new version
+    - path: "VERSION" # Simple version file
+      replace:
+        - "{version}" # Replace exact version string
+    - path: "pkg/version/version.go" # Go source file
+      replace:
+        - 'const Version = "{version}"' # Replace version in const declaration
+    - path: "package.json" # npm package file
+      replace:
+        - '"version": "{version}"' # Replace in version field
+    - path: "pyproject.toml" # Python project file
+      replace:
+        - 'version = "{version}"' # Replace in version field
+
+functions:
   - name: "generate_file_summary"
     type: "function"
     function:

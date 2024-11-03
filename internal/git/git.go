@@ -3,6 +3,7 @@ package git
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -12,6 +13,7 @@ import (
 	"codeberg.org/mutker/bumpa/internal/config"
 	"codeberg.org/mutker/bumpa/internal/errors"
 	"codeberg.org/mutker/bumpa/internal/logger"
+	"github.com/Masterminds/semver"
 	gogit "github.com/go-git/go-git/v5"
 	"github.com/go-git/go-git/v5/plumbing"
 	"github.com/go-git/go-git/v5/plumbing/format/gitignore"
@@ -144,6 +146,10 @@ func (r *Repository) GetCurrentBranch() (string, error) {
 
 //nolint:cyclop // Complex but necessary function handling multiple git operations
 func (r *Repository) GetFileDiff(path string) (string, error) {
+	logger.Debug().
+		Str("path", path).
+		Msg("Getting file diff")
+
 	w, err := r.repo.Worktree()
 	if err != nil {
 		return "", errors.WrapWithContext(
@@ -162,25 +168,36 @@ func (r *Repository) GetFileDiff(path string) (string, error) {
 		)
 	}
 
+	// Check if file was renamed
+	for oldPath, fileStatus := range status {
+		if fileStatus.Extra == path {
+			logger.Debug().
+				Str("old_path", oldPath).
+				Str("new_path", path).
+				Str("status", string(fileStatus.Staging)).
+				Msg("Found renamed file")
+			path = oldPath
+			break
+		}
+	}
+
 	fileStatus := status.File(path)
-	if fileStatus.Staging == Untracked {
+	logger.Debug().
+		Str("path", path).
+		Str("status", string(fileStatus.Staging)).
+		Msg("File status")
+
+	// Handle special statuses
+	switch fileStatus.Staging {
+	case Untracked:
 		return newFileMessage, nil
-	}
-	if fileStatus.Staging == Deleted {
+	case Deleted:
 		return deletedFileMessage, nil
+	case Renamed:
+		return fmt.Sprintf("[Renamed from %s]", fileStatus.Extra), nil
 	}
 
-	// Read current content
-	currentContent, err := os.ReadFile(path)
-	if err != nil {
-		return "", errors.WrapWithContext(
-			errors.CodeGitError,
-			err,
-			errors.FormatContext(errors.ContextFileRead, path),
-		)
-	}
-
-	// Get old content
+	// Get old content from HEAD
 	head, err := r.Head()
 	if err != nil {
 		return "", errors.WrapWithContext(
@@ -195,13 +212,16 @@ func (r *Repository) GetFileDiff(path string) (string, error) {
 		return "", errors.WrapWithContext(
 			errors.CodeGitError,
 			err,
-			"failed to get commit object",
+			errors.ContextGitDiff,
 		)
 	}
 
 	file, err := commit.File(path)
 	if err != nil {
 		if errors.Is(err, object.ErrFileNotFound) {
+			logger.Debug().
+				Str("path", path).
+				Msg("File not found in HEAD")
 			return newFileMessage, nil
 		}
 		return "", errors.WrapWithContext(
@@ -220,9 +240,34 @@ func (r *Repository) GetFileDiff(path string) (string, error) {
 		)
 	}
 
-	// Generate and truncate diff if needed
+	// For deleted files, only show old content
+	if fileStatus.Staging == Deleted {
+		diff := r.generateDiff(oldContent, "")
+		if len(strings.Split(diff, "\n")) > r.cfg.MaxDiffLines {
+			logger.Debug().
+				Int("max_lines", r.cfg.MaxDiffLines).
+				Msg("Truncating diff")
+			diff = strings.Join(strings.Split(diff, "\n")[:r.cfg.MaxDiffLines], "\n") + "\n..."
+		}
+		return diff, nil
+	}
+
+	// Read current content for modified files
+	currentContent, err := os.ReadFile(path)
+	if err != nil {
+		return "", errors.WrapWithContext(
+			errors.CodeGitError,
+			err,
+			errors.FormatContext(errors.ContextFileRead, path),
+		)
+	}
+
+	// Generate and truncate diff
 	diff := r.generateDiff(oldContent, string(currentContent))
 	if len(strings.Split(diff, "\n")) > r.cfg.MaxDiffLines {
+		logger.Debug().
+			Int("max_lines", r.cfg.MaxDiffLines).
+			Msg("Truncating diff")
 		diff = strings.Join(strings.Split(diff, "\n")[:r.cfg.MaxDiffLines], "\n") + "\n..."
 	}
 
@@ -321,6 +366,197 @@ func (r *Repository) GetUserConfig() (name, email string, err error) {
 	return name, email, nil
 }
 
+// FindLastVersionTag locates the most recent semantic version tag
+func (r *Repository) FindLastVersionTag() (string, error) {
+	refs, err := r.repo.References()
+	if err != nil {
+		return "", errors.WrapWithContext(
+			errors.CodeGitError,
+			err,
+			"failed to get repository references",
+		)
+	}
+
+	var lastTag string
+	var latestVersion *semver.Version
+
+	err = refs.ForEach(func(ref *plumbing.Reference) error {
+		if ref.Name().IsTag() {
+			// Extract version from tag name (remove 'v' prefix if present)
+			tagName := ref.Name().Short()
+			versionStr := strings.TrimPrefix(tagName, "v")
+
+			// Try to parse as semantic version
+			version, err := semver.NewVersion(versionStr)
+			if err != nil {
+				// Skip tags that aren't valid semantic versions
+				return nil
+			}
+
+			// Update if this is the highest version seen
+			if latestVersion == nil || version.GreaterThan(latestVersion) {
+				latestVersion = version
+				lastTag = tagName
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return "", errors.WrapWithContext(
+			errors.CodeGitError,
+			err,
+			"failed to iterate repository references",
+		)
+	}
+
+	return lastTag, nil
+}
+
+// GetChangesSinceTag returns commit messages between the specified tag and HEAD
+func (r *Repository) GetChangesSinceTag(tag string) ([]string, error) {
+	refs, err := r.repo.References()
+	if err != nil {
+		return nil, errors.WrapWithContext(
+			errors.CodeGitError,
+			err,
+			errors.ContextGitDiff,
+		)
+	}
+
+	var tagHash plumbing.Hash
+	var found bool
+
+	err = refs.ForEach(func(ref *plumbing.Reference) error {
+		if ref.Name().Short() == tag {
+			tagHash = ref.Hash()
+			found = true
+			return nil
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, errors.WrapWithContext(
+			errors.CodeGitError,
+			err,
+			errors.ContextGitDiff,
+		)
+	}
+
+	if !found {
+		return nil, errors.WrapWithContext(
+			errors.CodeGitError,
+			errors.ErrNotFound,
+			errors.FormatContext(errors.ContextGitFileNotFound, tag),
+		)
+	}
+
+	head, err := r.Head()
+	if err != nil {
+		return nil, errors.WrapWithContext(
+			errors.CodeGitError,
+			err,
+			errors.ContextGitBranch,
+		)
+	}
+
+	return r.GetChangesBetween(tagHash, head.Hash())
+}
+
+// GetChangeHistory retrieves commit messages since a specific tag or all commits
+func (r *Repository) GetChangeHistory(tag string) (string, error) {
+	// If no tag is provided, get all commits
+	if tag == "" {
+		messages, err := r.GetAllCommitMessages()
+		if err != nil {
+			return "", err
+		}
+		return strings.Join(messages, "\n"), nil
+	}
+
+	// Get changes since the specified tag
+	messages, err := r.GetChangesSinceTag(tag)
+	if err != nil {
+		return "", err
+	}
+	return strings.Join(messages, "\n"), nil
+}
+
+// GetChangesBetween returns commit messages between two commits
+func (r *Repository) GetChangesBetween(from, to plumbing.Hash) ([]string, error) {
+	var messages []string
+	current, err := r.CommitObject(to)
+	if err != nil {
+		return nil, errors.WrapWithContext(
+			errors.CodeGitError,
+			err,
+			errors.ContextGitCommit,
+		)
+	}
+
+	for current != nil && current.Hash != from {
+		messages = append(messages, strings.TrimSpace(current.Message))
+		if len(current.ParentHashes) == 0 {
+			break
+		}
+
+		current, err = r.CommitObject(current.ParentHashes[0])
+		if err != nil {
+			return nil, errors.WrapWithContext(
+				errors.CodeGitError,
+				err,
+				errors.ContextGitCommit,
+			)
+		}
+	}
+
+	return messages, nil
+}
+
+// GetCommitMessagesSince returns all commit messages since a given hash
+func (r *Repository) GetCommitMessagesSince(hash plumbing.Hash) ([]string, error) {
+	var messages []string
+	commit, err := r.CommitObject(hash)
+	if err != nil {
+		return nil, errors.WrapWithContext(
+			errors.CodeGitError,
+			err,
+			errors.ContextGitCommit,
+		)
+	}
+
+	for commit != nil {
+		messages = append(messages, strings.TrimSpace(commit.Message))
+		if len(commit.ParentHashes) == 0 {
+			break
+		}
+
+		commit, err = r.CommitObject(commit.ParentHashes[0])
+		if err != nil {
+			return nil, errors.WrapWithContext(
+				errors.CodeGitError,
+				err,
+				errors.ContextGitCommit,
+			)
+		}
+	}
+
+	return messages, nil
+}
+
+// GetAllCommitMessages returns all commit messages in the repository
+func (r *Repository) GetAllCommitMessages() ([]string, error) {
+	head, err := r.Head()
+	if err != nil {
+		return nil, errors.WrapWithContext(
+			errors.CodeGitError,
+			err,
+			errors.ContextGitBranch,
+		)
+	}
+
+	return r.GetCommitMessagesSince(head.Hash())
+}
+
 // stageFiles stages the given files in the worktree
 func stageFiles(w *gogit.Worktree, files []string) error {
 	for _, file := range files {
@@ -397,6 +633,73 @@ func (r *Repository) MakeCommit(ctx context.Context, message string, filesToAdd 
 				// Re-sign the commit using system git
 				cmd := exec.Command("git", "commit", "--amend", "--no-edit", "--gpg-sign")
 				cmd.Dir = w.Filesystem.Root()
+				cmd.Env = append(os.Environ(), "GPG_TTY="+os.Getenv("TTY"))
+				if err := cmd.Run(); err != nil {
+					return errors.WrapWithContext(
+						errors.CodeGitError,
+						err,
+						errors.ContextGitSigningFailed,
+					)
+				}
+			}
+		}
+
+		return nil
+	}
+}
+
+// CreateTag creates a new tag at HEAD with the given name and message
+func (r *Repository) CreateTag(ctx context.Context, name, message string) error {
+	select {
+	case <-ctx.Done():
+		return errors.Wrap(errors.CodeTimeoutError, ctx.Err())
+	default:
+		head, err := r.repo.Head()
+		if err != nil {
+			return errors.WrapWithContext(
+				errors.CodeGitError,
+				err,
+				errors.ContextGitBranch,
+			)
+		}
+
+		// Get user configuration for tag author
+		name, email, err := r.GetUserConfig()
+		if err != nil {
+			return err
+		}
+
+		// Create tag using go-git
+		_, err = r.repo.CreateTag(name, head.Hash(), &gogit.CreateTagOptions{
+			Message: message,
+			Tagger: &object.Signature{
+				Name:  name,
+				Email: email,
+				When:  time.Now(),
+			},
+		})
+		if err != nil {
+			return errors.WrapWithContext(
+				errors.CodeGitError,
+				err,
+				"failed to create tag",
+			)
+		}
+
+		// Check if tag signing is enabled and available
+		if isGitAvailable() {
+			signStr, err := getConfigValue("", "tag.gpgsign")
+			if err != nil {
+				return errors.WrapWithContext(
+					errors.CodeGitError,
+					err,
+					errors.ContextGitConfigReadError,
+				)
+			}
+
+			if signStr == "true" {
+				// Re-sign the tag using system git
+				cmd := exec.Command("git", "tag", "-f", "-s", name, "-m", message)
 				cmd.Env = append(os.Environ(), "GPG_TTY="+os.Getenv("TTY"))
 				if err := cmd.Run(); err != nil {
 					return errors.WrapWithContext(

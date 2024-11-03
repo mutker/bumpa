@@ -22,7 +22,7 @@
   - [x] Add retry logic for failed generations
 - [ ] Implement `pr` command
 - [ ] Implement `release-notes` command
-- [ ] Implement `version` command
+- [x] Implement `version` command
 
 ## Configuration
 - [x] Add support for custom LLM model configuration

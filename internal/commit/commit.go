@@ -25,32 +25,85 @@ var validTypes = []string{
 	"perf", "test", "chore", "ci", "build",
 }
 
-type Generator struct {
-	cfg   *config.Config
-	llm   llm.Client
-	repo  *git.Repository
-	tools []config.Tool
+// WorkflowState represents the current state of commit generation
+type WorkflowState struct {
+	Message        string   // Generated commit message
+	Files          []string // Files to be committed
+	HasChanges     bool     // Whether there are changes to commit
+	IsMessageValid bool     // Whether the generated message is valid
+	RetryCount     int      // Number of generation attempts
+	LastError      string   // Last error encountered
+	CanCommit      bool     // Whether commit is possible
 }
 
-func NewGenerator(cfg *config.Config, llmClient llm.Client, repo *git.Repository) (*Generator, error) {
-	if err := validateGeneratorConfig(cfg); err != nil {
+// Commit manages commit message generation
+type Commit struct {
+	cfg       *config.Config
+	llm       llm.Client
+	repo      *git.Repository
+	files     []string
+	lastError error
+}
+
+// NewGenerator creates a new commit message generator
+func NewGenerator(cfg *config.Config, llmClient llm.Client, repo *git.Repository) (*Commit, error) {
+	// Validate configuration and setup
+	if err := validateConfig(cfg); err != nil {
 		return nil, err
 	}
 
-	return &Generator{
-		cfg:   cfg,
-		llm:   llmClient,
-		repo:  repo,
-		tools: cfg.Tools,
+	return &Commit{
+		cfg:  cfg,
+		llm:  llmClient,
+		repo: repo,
 	}, nil
 }
 
-func (g *Generator) Generate(ctx context.Context) (string, error) {
+// GetWorkflowState provides the current state of the commit workflow
+func (g *Commit) GetWorkflowState(ctx context.Context) (*WorkflowState, error) {
+	// Get files to commit
+	files, err := g.repo.GetFilesToCommit()
+	if err != nil {
+		return nil, err
+	}
+
+	// Generate message if not already generated
+	var message string
+	var isValid bool
+	var lastError string
+	var retryCount int // Initialize retry count
+
+	if g.lastError != nil {
+		lastError = g.lastError.Error()
+	}
+
+	// If no message has been generated yet, attempt to generate
+	if message == "" {
+		message, err = g.Generate(ctx)
+		if err != nil {
+			lastError = err.Error()
+		} else {
+			isValid = g.isValidCommitMessage(message)
+		}
+	}
+
+	return &WorkflowState{
+		Message:        message,
+		Files:          files,
+		HasChanges:     len(files) > 0,
+		IsMessageValid: isValid,
+		RetryCount:     retryCount,
+		LastError:      lastError,
+		CanCommit:      isValid && len(files) > 0,
+	}, nil
+}
+
+func (g *Commit) Generate(ctx context.Context) (string, error) {
 	fileSummaries, err := g.getFileSummaries(ctx)
 	if err != nil {
 		if errors.Is(err, errors.ErrInvalidInput) {
 			return "", errors.WrapWithContext(
-				errors.CodeNoChanges, // Updated error code
+				errors.CodeNoChanges,
 				err,
 				"no changes are staged for commit - use 'git add' to stage files",
 			)
@@ -68,13 +121,12 @@ func (g *Generator) Generate(ctx context.Context) (string, error) {
 
 	logger.Info().Msgf("Analyzing changes in %d files", len(fileSummaries))
 
-	// Debug level for technical details
 	logger.Debug().
 		Interface("summaries", fileSummaries).
 		Msg("File change summaries")
 
 	diffSummary := g.generateDiffSummary(fileSummaries)
-	commitMessage, err := g.generateCommitMessageFromSummary(ctx, diffSummary)
+	commitMessage, err := g.getCommitMessage(ctx, diffSummary)
 	if err != nil {
 		return "", err
 	}
@@ -82,7 +134,7 @@ func (g *Generator) Generate(ctx context.Context) (string, error) {
 	return strings.TrimSuffix(commitMessage, "."), nil
 }
 
-func (g *Generator) getCurrentBranch() (string, error) {
+func (g *Commit) getCurrentBranch() (string, error) {
 	head, err := g.repo.Head()
 	if err != nil {
 		return "", errors.Wrap(errors.CodeGitError, err)
@@ -125,27 +177,23 @@ func (g *Generator) getCurrentBranch() (string, error) {
 	return closestBranch, nil
 }
 
-func (g *Generator) findTool(name string) *config.Tool {
-	tool := config.FindTool(g.tools, name)
-	if tool != nil {
+func (g *Commit) findFunction(name string) *config.LLMFunction {
+	fn := config.FindFunction(g.cfg.Functions, name)
+	if fn != nil {
 		logger.Debug().
-			Str("tool_name", name).
-			Str("system_prompt", tool.SystemPrompt).
-			Str("user_prompt", tool.UserPrompt).
+			Str("function_name", fn.Name).
+			Str("system_prompt", fn.SystemPrompt).
+			Str("user_prompt", fn.UserPrompt).
 			Msg("Found tool configuration")
-	} else {
-		logger.Debug().
-			Str("tool_name", name).
-			Msg("Tool configuration not found")
 	}
-	return tool
+	return fn
 }
 
-func (g *Generator) shouldIgnoreFile(path string) bool {
+func (g *Commit) shouldIgnoreFile(path string) bool {
 	return g.repo.ShouldIgnoreFile(path, g.cfg.Git.Ignore, g.cfg.Git.IncludeGitignore)
 }
 
-func (g *Generator) generateDiffSummary(fileSummaries map[string]string) string {
+func (g *Commit) generateDiffSummary(fileSummaries map[string]string) string {
 	branchName, err := g.repo.GetCurrentBranch()
 	if err != nil {
 		logger.Warn().Err(err).Msg("failed to get current branch name")
@@ -187,7 +235,7 @@ func (g *Generator) generateDiffSummary(fileSummaries map[string]string) string 
 	return summaryBuilder.String()
 }
 
-func (g *Generator) generateFileSummary(ctx context.Context, path string, status git.StatusCode) (string, error) {
+func (g *Commit) getFileSummary(ctx context.Context, path string, status git.StatusCode) (string, error) {
 	logger.Debug().
 		Str("path", path).
 		Str("status", git.GetFileStatus(status)).
@@ -211,15 +259,15 @@ func (g *Generator) generateFileSummary(ctx context.Context, path string, status
 		"hasSignificantChanges": hasSignificantChanges,
 	}
 
-	tool := g.findTool("generate_file_summary")
+	tool := g.findFunction("generate_file_summary")
 	if tool == nil {
 		logger.Error().
-			Str("tool", "generate_file_summary").
-			Msg("Required tool not found in configuration")
+			Str("function", "generate_file_summary").
+			Msg("Required function not found in configuration")
 		return "", errors.WrapWithContext(
 			errors.CodeConfigError,
 			errors.ErrInvalidInput,
-			"generate_file_summary tool not found in configuration",
+			"generate_file_summary function not found in configuration",
 		)
 	}
 
@@ -227,7 +275,7 @@ func (g *Generator) generateFileSummary(ctx context.Context, path string, status
 		Interface("input", input).
 		Msg("Analyzing file changes")
 
-	summary, err := llm.CallTool(ctx, g.llm, tool, input)
+	summary, err := llm.CallFunction(ctx, g.llm, tool, input)
 	if err != nil {
 		logger.Error().
 			Err(err).
@@ -239,7 +287,7 @@ func (g *Generator) generateFileSummary(ctx context.Context, path string, status
 	return summary, nil
 }
 
-func (g *Generator) getFileSummaries(ctx context.Context) (map[string]string, error) {
+func (g *Commit) getFileSummaries(ctx context.Context) (map[string]string, error) {
 	status, err := g.repo.Status()
 	if err != nil {
 		return nil, errors.Wrap(errors.CodeGitError, err)
@@ -251,7 +299,7 @@ func (g *Generator) getFileSummaries(ctx context.Context) (map[string]string, er
 			continue
 		}
 
-		summary, err := g.generateFileSummary(ctx, path, fileStatus.Staging)
+		summary, err := g.getFileSummary(ctx, path, fileStatus.Staging)
 		if err != nil {
 			return nil, errors.WrapWithContext(
 				errors.CodeGitError,
@@ -275,17 +323,17 @@ func (g *Generator) getFileSummaries(ctx context.Context) (map[string]string, er
 }
 
 //nolint:cyclop // Complex function handling commit message generation
-func (g *Generator) generateCommitMessageFromSummary(ctx context.Context, summary string) (string, error) {
+func (g *Commit) getCommitMessage(ctx context.Context, summary string) (string, error) {
 	select {
 	case <-ctx.Done():
 		return "", errors.Wrap(errors.CodeTimeoutError, ctx.Err())
 	default:
-		tool := g.findTool("generate_commit_message")
-		if tool == nil {
+		function := g.findFunction("generate_commit_message")
+		if function == nil {
 			return "", errors.WrapWithContext(
 				errors.CodeConfigError,
 				errors.ErrInvalidConfig,
-				"generate_commit_message tool not found",
+				"generate_commit_message function not found",
 			)
 		}
 
@@ -313,24 +361,23 @@ func (g *Generator) generateCommitMessageFromSummary(ctx context.Context, summar
 					Msg("Retrying commit message generation")
 			}
 
-			// Use retry tool if this isn't the first attempt
-			currentTool := tool
+			currentFunction := function
 			input := map[string]interface{}{
 				"summary": summary,
 				"branch":  branchName,
 			}
 
 			if retries > 0 {
-				currentTool = g.findTool("retry_commit_message")
-				if currentTool == nil {
-					logger.Debug().Msg("Retry tool not found, using original tool")
-					currentTool = tool
+				currentFunction = g.findFunction("retry_commit_message")
+				if currentFunction == nil {
+					logger.Debug().Msg("Retry function not found, using original function")
+					currentFunction = function
 				}
 				input["previous"] = lastMessage
 				input["error"] = lastError
 			}
 
-			message, err := llm.CallTool(ctx, g.llm, currentTool, input)
+			message, err := llm.CallFunction(ctx, g.llm, currentFunction, input)
 			if err != nil {
 				logger.Debug().
 					Err(err).
@@ -341,18 +388,13 @@ func (g *Generator) generateCommitMessageFromSummary(ctx context.Context, summar
 
 			message = cleanCommitMessage(message)
 
-			if g.isValidCommitMessage(message) {
-				return message, nil
+			if invalid := g.analyzeInvalidMessage(message); invalid != "" {
+				lastMessage = message
+				lastError = invalid
+				continue
 			}
 
-			lastMessage = message
-			lastError = g.analyzeInvalidMessage(message)
-
-			logger.Debug().
-				Str("message", message).
-				Str("error", lastError).
-				Int("attempt", retries+1).
-				Msg("Invalid commit message")
+			return message, nil
 		}
 
 		// Final error after all retries
@@ -373,36 +415,8 @@ func (g *Generator) generateCommitMessageFromSummary(ctx context.Context, summar
 	}
 }
 
-func cleanCommitMessage(message string) string {
-	// Remove any markdown formatting
-	message = strings.ReplaceAll(message, "`", "")
-	message = strings.ReplaceAll(message, "\"", "")
-
-	// Get first line only
-	if idx := strings.Index(message, "\n"); idx != -1 {
-		message = message[:idx]
-	}
-
-	// Remove common prefixes LLMs might add
-	prefixes := []string{
-		"Here's a commit message:",
-		"Commit message:",
-		"Generated commit message:",
-		"The commit message is:",
-	}
-	for _, prefix := range prefixes {
-		message = strings.TrimPrefix(message, prefix)
-	}
-
-	// Clean up whitespace and periods
-	message = strings.TrimSpace(message)
-	message = strings.TrimSuffix(message, ".")
-
-	return message
-}
-
 //nolint:cyclop // Complexity justified by nature of validation logic
-func (g *Generator) analyzeInvalidMessage(message string) string {
+func (g *Commit) analyzeInvalidMessage(message string) string {
 	if message == "" {
 		return "empty message"
 	}
@@ -499,7 +513,7 @@ func (g *Generator) analyzeInvalidMessage(message string) string {
 	return "unknown validation error"
 }
 
-func (*Generator) filterImportChanges(diff string) (string, bool) {
+func (*Commit) filterImportChanges(diff string) (string, bool) {
 	lines := strings.Split(diff, "\n")
 	var filteredLines []string
 	inImportBlock := false
@@ -529,7 +543,7 @@ func (*Generator) filterImportChanges(diff string) (string, bool) {
 }
 
 //nolint:cyclop // Complex function handling multiple validation steps
-func (g *Generator) isValidCommitMessage(message string) bool {
+func (g *Commit) isValidCommitMessage(message string) bool {
 	lines := strings.Split(message, "\n")
 	if len(lines) == 0 || strings.TrimSpace(lines[0]) == "" {
 		return false
@@ -621,7 +635,35 @@ func (g *Generator) isValidCommitMessage(message string) bool {
 	return true
 }
 
-func validateGeneratorConfig(cfg *config.Config) error {
+func cleanCommitMessage(message string) string {
+	// Remove any markdown formatting
+	message = strings.ReplaceAll(message, "`", "")
+	message = strings.ReplaceAll(message, "\"", "")
+
+	// Get first line only
+	if idx := strings.Index(message, "\n"); idx != -1 {
+		message = message[:idx]
+	}
+
+	// Remove common prefixes LLMs might add
+	prefixes := []string{
+		"Here's a commit message:",
+		"Commit message:",
+		"Generated commit message:",
+		"The commit message is:",
+	}
+	for _, prefix := range prefixes {
+		message = strings.TrimPrefix(message, prefix)
+	}
+
+	// Clean up whitespace and periods
+	message = strings.TrimSpace(message)
+	message = strings.TrimSuffix(message, ".")
+
+	return message
+}
+
+func validateConfig(cfg *config.Config) error {
 	if cfg == nil {
 		return errors.WrapWithContext(
 			errors.CodeConfigError,
@@ -629,30 +671,30 @@ func validateGeneratorConfig(cfg *config.Config) error {
 			"configuration is required",
 		)
 	}
-	if len(cfg.Tools) == 0 {
+	if len(cfg.Functions) == 0 {
 		return errors.WrapWithContext(
 			errors.CodeConfigError,
 			errors.ErrInvalidInput,
-			"missing required tools configuration",
+			"missing required functions configuration",
 		)
 	}
 
-	requiredTools := []string{"generate_file_summary", "generate_commit_message"}
-	for _, tool := range requiredTools {
-		if !hasToolConfig(cfg.Tools, tool) {
+	requiredFunctions := []string{"generate_file_summary", "generate_commit_message"}
+	for _, function := range requiredFunctions {
+		if !hasFunctionConfig(cfg.Functions, function) {
 			return errors.WrapWithContext(
 				errors.CodeConfigError,
 				errors.ErrInvalidInput,
-				"missing required tool: "+tool,
+				"missing required function: "+function,
 			)
 		}
 	}
 	return nil
 }
 
-func hasToolConfig(tools []config.Tool, name string) bool {
-	for i := range tools {
-		if tools[i].Name == name {
+func hasFunctionConfig(functions []config.LLMFunction, name string) bool {
+	for i := range functions {
+		if functions[i].Name == name {
 			return true
 		}
 	}

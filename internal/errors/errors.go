@@ -21,6 +21,7 @@ const (
 	CodeRuntimeError  = "runtime_error"
 	CodeTimeoutError  = "timeout_error"
 	CodeValidateError = "validate_error"
+	CodeVersionError  = "version_error"
 
 	// Domain errors
 	CodeGitError      = "git_error"
@@ -45,6 +46,7 @@ var errorMessages = map[string]string{
 	CodeTemplateError: "template processing failed",
 	CodeNoChanges:     "no changes staged for commit",
 	CodeLLMGenFailed:  "failed to generate valid commit message",
+	CodeVersionError:  "version operation failed",
 }
 
 // Base errors - Layer 3
@@ -61,13 +63,13 @@ var (
 // Error contexts - Layer 4
 const (
 	// Configuration contexts
-	ContextConfigNotFound    = "config file not found"
-	ContextConfigUnmarshal   = "failed to unmarshal configuration"
-	ContextInvalidLogLevel   = "invalid log level specified"
-	ContextInvalidTimeFormat = "invalid time format specified"
-	ContextMissingToolConfig = "required tool configuration missing"
-	ContextMissingPrompt     = "missing %s prompt for tool: %s" // system/user
-	ContextMissingAPIKey     = "API key required for %s provider"
+	ContextConfigNotFound        = "config file not found"
+	ContextConfigUnmarshal       = "failed to unmarshal configuration"
+	ContextInvalidLogLevel       = "invalid log level specified"
+	ContextInvalidTimeFormat     = "invalid time format specified"
+	ContextMissingFunctionConfig = "required function configuration missing"
+	ContextMissingPrompt         = "missing %s prompt for function: %s" // system/user
+	ContextMissingAPIKey         = "API key required for %s provider"
 
 	// Git contexts
 	ContextNoChanges            = "no changes staged for commit - use 'git add' to stage files"
@@ -87,12 +89,17 @@ const (
 	ContextGitSigningFailed     = "failed to sign git commit"
 	ContextGitSigningKey        = "failed to get git signing key"
 	ContextGitSigningConfig     = "failed to read git signing configuration"
+	ContextGitFileDeleted       = "file has been deleted: %s"
+	ContextGitFileRenamed       = "file has been renamed from %s to %s"
+	ContextGitFileNotFound      = "file not found in repository: %s"
+	ContextGitFileStatus        = "file status: %s"
+	ContextGitDiffTruncated     = "diff truncated at %d lines"
 
 	// LLM contexts
 	ContextLLMRequest         = "failed to make LLM request"
 	ContextLLMResponse        = "failed to decode LLM response"
 	ContextLLMNoChoices       = "no choices in LLM response"
-	ContextLLMEmptyResponse   = "empty response from LLM tool"
+	ContextLLMEmptyResponse   = "empty response from LLM function"
 	ContextLLMInvalidResponse = "invalid response format from LLM"
 	ContextLLMRateLimit       = "rate limit exceeded"
 	ContextLLMTimeout         = "LLM request timed out"
@@ -111,6 +118,15 @@ const (
 	ContextFileWrite  = "failed to write file: %s"
 	ContextFileDelete = "failed to delete file: %s"
 	ContextDirCreate  = "failed to create directory: %s"
+
+	// Version bump contexts
+	ContextVersionAnalyze    = "failed to analyze version changes"
+	ContextVersionParse      = "failed to parse version suggestion"
+	ContextVersionInvalid    = "invalid version format"
+	ContextVersionPreRelease = "invalid pre-release format: %s"
+	ContextVersionBumpType   = "invalid bump type: %s"
+	ContextVersionPropose    = "failed to propose version change"
+	ContextVersionApply      = "failed to apply version change"
 )
 
 // Helper functions
@@ -186,12 +202,34 @@ func IsGitConfigError(err error) bool {
 		strings.Contains(errStr, ContextGitConfigInvalidMode)
 }
 
+func IsGitFileOperation(err error) bool {
+	if err == nil {
+		return false
+	}
+	errStr := err.Error()
+	return strings.Contains(errStr, ContextGitFileDeleted) ||
+		strings.Contains(errStr, ContextGitFileRenamed) ||
+		strings.Contains(errStr, ContextGitFileNotFound)
+}
+
 func IsNoChanges(err error) bool {
 	return GetCode(err) == CodeNoChanges
 }
 
 func IsLLMError(err error) bool {
 	return GetCode(err) == CodeLLMError
+}
+
+func IsVersionError(err error) bool {
+	return GetCode(err) == CodeVersionError
+}
+
+func IsVersionBumpTypeError(err error) bool {
+	return err != nil && strings.Contains(err.Error(), ContextVersionBumpType)
+}
+
+func IsVersionPreReleaseError(err error) bool {
+	return err != nil && strings.Contains(err.Error(), ContextVersionPreRelease)
 }
 
 func IsTimeoutError(err error) bool {
