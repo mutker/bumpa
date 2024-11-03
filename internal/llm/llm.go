@@ -106,7 +106,7 @@ type ToolCallArguments struct {
 	Summary               string `json:"summary"`
 }
 
-//nolint:ireturn // Interface return needed for provider flexibility and testing
+//nolint:ireturn,nolintlint // Interface return needed for provider flexibility and testing
 func New(cfg *config.LLMConfig) (Client, error) {
 	logger.Debug().
 		Str("provider", cfg.Provider).

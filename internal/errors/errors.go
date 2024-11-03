@@ -82,6 +82,11 @@ const (
 	ContextGitIgnore            = "failed to read gitignore patterns"
 	ContextGitConfigInvalidMode = "invalid git config mode"
 	ContextGitConfigReadError   = "failed to read git config"
+	ContextGitConfigWriteError  = "failed to write git config"
+	ContextGitSigningDisabled   = "git commit signing is disabled"
+	ContextGitSigningFailed     = "failed to sign git commit"
+	ContextGitSigningKey        = "failed to get git signing key"
+	ContextGitSigningConfig     = "failed to read git signing configuration"
 
 	// LLM contexts
 	ContextLLMRequest         = "failed to make LLM request"
@@ -159,6 +164,26 @@ func GetCode(err error) string {
 // Error type checking
 func IsConfigFileNotFound(err error) bool {
 	return err != nil && strings.Contains(err.Error(), ContextConfigNotFound)
+}
+
+func IsGitSigningError(err error) bool {
+	if err == nil {
+		return false
+	}
+	errStr := err.Error()
+	return strings.Contains(errStr, ContextGitSigningFailed) ||
+		strings.Contains(errStr, ContextGitSigningKey) ||
+		strings.Contains(errStr, ContextGitSigningConfig)
+}
+
+func IsGitConfigError(err error) bool {
+	if err == nil {
+		return false
+	}
+	errStr := err.Error()
+	return strings.Contains(errStr, ContextGitConfigReadError) ||
+		strings.Contains(errStr, ContextGitConfigWriteError) ||
+		strings.Contains(errStr, ContextGitConfigInvalidMode)
 }
 
 func IsNoChanges(err error) bool {

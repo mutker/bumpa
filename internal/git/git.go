@@ -4,6 +4,7 @@ package git
 import (
 	"context"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"time"
@@ -272,7 +273,7 @@ func (r *Repository) GetFilesToCommit() ([]string, error) {
 // getUserConfig returns the user's name and email from git config.
 //
 //nolint:nonamedreturns,cyclop // Using named returns for clarity as recommended by gocritic
-func (r *Repository) getUserConfig() (name, email string, err error) {
+func (r *Repository) GetUserConfig() (name, email string, err error) {
 	// With includeIf support, we should first try to get the effective config values
 	// directly from git, letting it handle all the config resolution
 	if isGitAvailable() {
@@ -336,6 +337,8 @@ func stageFiles(w *gogit.Worktree, files []string) error {
 }
 
 // MakeCommit creates a new commit with the given message and files
+//
+//nolint:cyclop // Complexity required for proper commit creation and signing
 func (r *Repository) MakeCommit(ctx context.Context, message string, filesToAdd []string) error {
 	select {
 	case <-ctx.Done():
@@ -357,12 +360,12 @@ func (r *Repository) MakeCommit(ctx context.Context, message string, filesToAdd 
 		}
 
 		// Get user configuration
-		name, email, err := r.getUserConfig()
+		name, email, err := r.GetUserConfig()
 		if err != nil {
 			return err
 		}
 
-		// Create commit
+		// Create initial commit
 		_, err = w.Commit(message, &gogit.CommitOptions{
 			Author: &object.Signature{
 				Name:  name,
@@ -377,6 +380,32 @@ func (r *Repository) MakeCommit(ctx context.Context, message string, filesToAdd 
 				err,
 				errors.ContextGitCommit,
 			)
+		}
+
+		// Check if commit signing is enabled and available
+		if isGitAvailable() {
+			signStr, err := getConfigValue("", "commit.gpgsign")
+			if err != nil {
+				return errors.WrapWithContext(
+					errors.CodeGitError,
+					err,
+					errors.ContextGitConfigReadError,
+				)
+			}
+
+			if signStr == "true" {
+				// Re-sign the commit using system git
+				cmd := exec.Command("git", "commit", "--amend", "--no-edit", "--gpg-sign")
+				cmd.Dir = w.Filesystem.Root()
+				cmd.Env = append(os.Environ(), "GPG_TTY="+os.Getenv("TTY"))
+				if err := cmd.Run(); err != nil {
+					return errors.WrapWithContext(
+						errors.CodeGitError,
+						err,
+						errors.ContextGitSigningFailed,
+					)
+				}
+			}
 		}
 
 		return nil

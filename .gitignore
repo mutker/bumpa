@@ -8,3 +8,4 @@
 /build/
 /var/
 /vendor/
+*_test.log

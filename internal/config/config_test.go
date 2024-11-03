@@ -107,7 +107,7 @@ func TestEnvironmentConfigValidation(t *testing.T) {
 				TimeFormat: "2006-01-02 15:04:05",
 				Output:     "file",
 				Level:      "info",
-				Path:       "test.log",
+				Path:       "config_test.log",
 				FilePerms:  0o644,
 			},
 			wantErr: false,
