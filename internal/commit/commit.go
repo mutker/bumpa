@@ -361,6 +361,7 @@ func (g *Commit) getCommitMessage(ctx context.Context, summary string) (string, 
 					Msg("Retrying commit message generation")
 			}
 
+			// Use retry function if this isn't the first attempt
 			currentFunction := function
 			input := map[string]interface{}{
 				"summary": summary,
@@ -388,9 +389,22 @@ func (g *Commit) getCommitMessage(ctx context.Context, summary string) (string, 
 
 			message = cleanCommitMessage(message)
 
+			// INFO log for the proposed commit message
+			logger.Info().
+				Str("proposed_message", message).
+				Int("attempt", retries+1).
+				Msg("Proposed commit message")
+
 			if invalid := g.analyzeInvalidMessage(message); invalid != "" {
 				lastMessage = message
 				lastError = invalid
+
+				logger.Debug().
+					Str("message", message).
+					Str("error", lastError).
+					Int("attempt", retries+1).
+					Msg("Invalid commit message")
+
 				continue
 			}
 
@@ -434,12 +448,18 @@ func (g *Commit) analyzeInvalidMessage(message string) string {
 		return "missing colon separator"
 	}
 
-	parts := strings.SplitN(header, ":", 2) //nolint:mnd // Split into type+scope and description
+	parts := strings.SplitN(header, ":", 2)
 	typeAndScope := parts[0]
 	description := ""
 	if len(parts) > 1 {
-		description = strings.TrimSpace(parts[1])
+		description = parts[1] // Include full description
 	}
+
+	// Check spacing after colon
+	if len(description) == 0 || description[0] != ' ' {
+		return "must have exactly one space after colon"
+	}
+	description = strings.TrimSpace(description)
 
 	// Check type
 	validTypes := []string{
@@ -464,7 +484,7 @@ func (g *Commit) analyzeInvalidMessage(message string) string {
 			return "malformed scope - missing closing parenthesis"
 		}
 		scope := strings.TrimSuffix(strings.TrimPrefix(
-			typeAndScope[strings.Index(typeAndScope, "("):], //nolint:gocritic // Index won't return -1 due to Contains check
+			typeAndScope[strings.Index(typeAndScope, "("):],
 			"(",
 		), ")")
 		if scope == "" {
@@ -478,9 +498,6 @@ func (g *Commit) analyzeInvalidMessage(message string) string {
 	// Check description
 	if description == "" {
 		return "missing description"
-	}
-	if !strings.HasPrefix(description, " ") || strings.HasPrefix(description, "  ") {
-		return "must have exactly one space after colon"
 	}
 	if strings.HasSuffix(description, ".") {
 		return "description ends with period"
@@ -501,7 +518,7 @@ func (g *Commit) analyzeInvalidMessage(message string) string {
 		for i, line := range lines[2:] {
 			if len(line) > g.cfg.Git.PreferredLineLength {
 				logger.Warn().
-					Int("line_number", i+3). //nolint:mnd // Offset for human-readable line numbers
+					Int("line_number", i+3).
 					Str("line", line).
 					Int("preferred_length", g.cfg.Git.PreferredLineLength).
 					Int("actual_length", len(line)).
@@ -510,7 +527,7 @@ func (g *Commit) analyzeInvalidMessage(message string) string {
 		}
 	}
 
-	return "unknown validation error"
+	return ""
 }
 
 func (*Commit) filterImportChanges(diff string) (string, bool) {
@@ -560,7 +577,7 @@ func (g *Commit) isValidCommitMessage(message string) bool {
 
 	// Check type(scope): description format
 	typeMatch := fmt.Sprintf(`^(%s)`, strings.Join(validTypes, "|"))
-	headerPattern := fmt.Sprintf( //nolint:perfsprint // More readable for regex pattern construction
+	headerPattern := fmt.Sprintf(
 		`%s(\([a-z][a-z0-9-]*\))?: [a-z][-a-z0-9 ]*[a-z0-9]$`,
 		typeMatch,
 	)
@@ -574,16 +591,26 @@ func (g *Commit) isValidCommitMessage(message string) bool {
 		return false
 	}
 
-	parts := strings.SplitN(header, ":", 2) //nolint:mnd // Split into type+scope and description
-	if len(parts) != 2 || !strings.HasPrefix(parts[1], " ") || strings.HasPrefix(parts[1], "  ") {
+	// More precise colon and space validation
+	parts := strings.SplitN(header, ":", 2)
+	if len(parts) != 2 {
 		logger.Debug().
 			Str("header", header).
+			Msg("Missing colon")
+		return false
+	}
+
+	description := parts[1]
+	if len(description) == 0 || description[0] != ' ' || strings.HasPrefix(description, "  ") {
+		logger.Debug().
+			Str("header", header).
+			Str("description", description).
 			Msg("Invalid spacing around colon")
 		return false
 	}
 
-	// Validate no uppercase in description
-	description := strings.TrimSpace(parts[1])
+	// Trim and validate description
+	description = strings.TrimSpace(description)
 	if strings.ToLower(description) != description {
 		logger.Debug().
 			Str("description", description).
@@ -606,19 +633,11 @@ func (g *Commit) isValidCommitMessage(message string) bool {
 			logger.Debug().Msg("Missing blank line after header")
 			return false
 		}
-	}
-
-	// Validate body format if present
-	if len(lines) > 1 {
-		if len(lines) > 2 && lines[1] != "" {
-			logger.Debug().Msg("Missing blank line after header")
-			return false
-		}
 
 		for i, line := range lines[2:] {
 			if len(line) > g.cfg.Git.PreferredLineLength {
 				logger.Warn().
-					Int("line_number", i+3). //nolint:mnd // Offset for human-readable line numbers
+					Int("line_number", i+3).
 					Str("line", line).
 					Int("preferred_length", g.cfg.Git.PreferredLineLength).
 					Int("actual_length", len(line)).
