@@ -34,9 +34,14 @@ var commitPatterns = struct {
 	description string
 	header      string
 }{
-	typeScope:   fmt.Sprintf(`^(%s)(\(%s\))?$`, validTypes, validScope),
-	description: fmt.Sprintf(`^(%s)[-a-z0-9 ]*[a-z0-9]$`, validVerbs),
-	header:      fmt.Sprintf(`^(%s)(\(%s\))?: [a-z][-a-z0-9 ]*[a-z0-9]$`, validTypes, validScope),
+	// Type and scope must be lowercase
+	typeScope: fmt.Sprintf(`^(%s)(\(%s\))?$`, validTypes, validScope),
+
+	// Description can be mixed case
+	description: `^[a-z]+[a-z0-9 -]*[a-z0-9]$`,
+
+	// Type and scope lowercase, description can start with capital
+	header: fmt.Sprintf(`^(%s)(\(%s\))?: [A-Z][-A-Za-z0-9 ]+[a-z0-9]$`, validTypes, validScope),
 }
 
 // WorkflowState represents the current state of commit generation
@@ -486,11 +491,6 @@ func (g *Commit) ValidateCommitMessage(message string) CommitValidationResult {
 	header := lines[0]
 
 	if len(header) > maxHeaderLength {
-		logger.Warn().
-			Str("header", header).
-			Int("length", len(header)).
-			Int("max_length", maxHeaderLength).
-			Msg("Commit message header exceeds maximum length")
 		return CommitValidationResult{
 			Valid:   false,
 			Message: fmt.Sprintf("header too long (%d chars, max %d)", len(header), maxHeaderLength),
@@ -512,11 +512,10 @@ func (g *Commit) ValidateCommitMessage(message string) CommitValidationResult {
 
 	// Type and scope validation
 	if !regexp.MustCompile(commitPatterns.typeScope).MatchString(typeAndScope) {
-		logger.Debug().
-			Str("type_and_scope", typeAndScope).
-			Str("pattern", commitPatterns.typeScope).
-			Msg("Invalid type or scope format")
-		return CommitValidationResult{Valid: false, Message: fmt.Sprintf("invalid type or scope format in '%s'", typeAndScope)}
+		return CommitValidationResult{
+			Valid:   false,
+			Message: fmt.Sprintf("invalid type or scope format in '%s'", typeAndScope),
+		}
 	}
 
 	// Description validation
@@ -524,13 +523,42 @@ func (g *Commit) ValidateCommitMessage(message string) CommitValidationResult {
 		return CommitValidationResult{Valid: false, Message: "description ends with period"}
 	}
 
+	// Explicit verb and description validation
+	descriptionWords := strings.Fields(description)
+	if len(descriptionWords) == 0 {
+		return CommitValidationResult{Valid: false, Message: "description is empty"}
+	}
+
+	// Check first word is a valid verb (case-sensitive)
+	firstWord := descriptionWords[0]
+	validVerbsList := []string{
+		"add", "update", "remove", "fix", "refactor",
+		"implement", "improve", "change", "modify",
+		"delete", "revert", "merge",
+	}
+
+	verbFound := false
+	for _, verb := range validVerbsList {
+		if firstWord == verb {
+			verbFound = true
+			break
+		}
+	}
+
+	if !verbFound {
+		return CommitValidationResult{
+			Valid: false,
+			Message: "description must start with a valid verb: " +
+				strings.Join(validVerbsList, ", "),
+		}
+	}
+
+	// Detailed description validation
 	if !regexp.MustCompile(commitPatterns.description).MatchString(description) {
-		logger.Debug().
-			Str("description", description).
-			Str("pattern", commitPatterns.description).
-			Msg("Invalid description format")
-		return CommitValidationResult{Valid: false, Message: "description must start with " +
-			"valid verb and contain only lowercase letters, numbers, spaces, and hyphens"}
+		return CommitValidationResult{
+			Valid:   false,
+			Message: "description must contain only lowercase letters, numbers, spaces, and hyphens",
+		}
 	}
 
 	// Body validation
@@ -541,12 +569,10 @@ func (g *Commit) ValidateCommitMessage(message string) CommitValidationResult {
 
 		for i, line := range lines[2:] {
 			if len(line) > g.cfg.Git.PreferredLineLength {
-				logger.Warn().
-					Int("line_number", i+lineNumberOffset).
-					Str("line", line).
-					Int("preferred_length", g.cfg.Git.PreferredLineLength).
-					Int("actual_length", len(line)).
-					Msg("Line exceeds preferred length")
+				return CommitValidationResult{
+					Valid:   false,
+					Message: fmt.Sprintf("line %d exceeds preferred length", i+lineNumberOffset),
+				}
 			}
 		}
 	}

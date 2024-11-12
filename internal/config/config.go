@@ -97,9 +97,9 @@ type FunctionParameters struct {
 }
 
 type Property struct {
-	Type        string    `mapstructure:"type"           yaml:"type"`
-	Description string    `mapstructure:"description"    yaml:"description"`
-	Enum        []string  `mapstructure:"enum,omitempty" yaml:"enum,omitempty"`
+	Type        string    `mapstructure:"type"            yaml:"type"`
+	Description string    `mapstructure:"description"     yaml:"description"`
+	Enum        []string  `mapstructure:"enum,omitempty"  yaml:"enum,omitempty"`
 	Items       *Property `mapstructure:"items,omitempty" yaml:"items,omitempty"`
 }
 

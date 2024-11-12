@@ -648,7 +648,7 @@ func (r *Repository) MakeCommit(ctx context.Context, message string, filesToAdd 
 }
 
 // CreateTag creates a new tag at HEAD with the given name and message
-func (r *Repository) CreateTag(ctx context.Context, _, message string) error {
+func (r *Repository) CreateTag(ctx context.Context, tagName, message string) error {
 	select {
 	case <-ctx.Done():
 		return errors.Wrap(errors.CodeTimeoutError, ctx.Err())
@@ -669,7 +669,7 @@ func (r *Repository) CreateTag(ctx context.Context, _, message string) error {
 		}
 
 		// Create tag using go-git
-		_, err = r.repo.CreateTag(name, head.Hash(), &gogit.CreateTagOptions{
+		_, err = r.repo.CreateTag(tagName, head.Hash(), &gogit.CreateTagOptions{
 			Message: message,
 			Tagger: &object.Signature{
 				Name:  name,
@@ -698,7 +698,7 @@ func (r *Repository) CreateTag(ctx context.Context, _, message string) error {
 
 			if signStr == "true" {
 				// Re-sign the tag using system git
-				cmd := exec.Command("git", "tag", "-f", "-s", name, "-m", message)
+				cmd := exec.Command("git", "tag", "-f", "-s", tagName, "-m", message)
 				cmd.Env = append(os.Environ(), "GPG_TTY="+os.Getenv("TTY"))
 				if err := cmd.Run(); err != nil {
 					return errors.WrapWithContext(
