@@ -15,6 +15,11 @@ import (
 	"github.com/go-git/go-git/v5/plumbing"
 )
 
+const (
+	filePerms            = 0o600
+	summaryCapacityRatio = 2 // Estimate initial capacity as half of total items
+)
+
 // Bumper manages version changes across files and git repository
 type Bumper struct {
 	cfg      *config.Config
@@ -117,7 +122,7 @@ func (b *Bumper) GetCurrentVersion() string {
 
 // GetFilesToUpdate returns paths of all files that will be updated during version change
 func (b *Bumper) GetFilesToUpdate() []string {
-	var files []string
+	files := make([]string, 0, len(b.files))
 	for _, f := range b.files {
 		files = append(files, f.Path)
 	}
@@ -126,6 +131,40 @@ func (b *Bumper) GetFilesToUpdate() []string {
 
 // AnalyzeVersionChanges analyzes changes and suggests version bump
 func (b *Bumper) AnalyzeVersionChanges(ctx context.Context) (string, error) {
+	// If this is the initial version, propose 0.1.0 without any further analysis
+	if b.current.String() == "0.1.0" {
+		b.proposed = b.current
+		return b.current.String(), nil
+	}
+
+	// Check if there are any changes to analyze
+	status, err := b.repo.Status()
+	if err != nil {
+		return "", errors.WrapWithContext(
+			errors.CodeGitError,
+			err,
+			errors.ContextGitStatus,
+		)
+	}
+
+	// If no changes, propose current version
+	var hasChanges bool
+	for path := range status {
+		if !b.repo.ShouldIgnoreFile(path, b.cfg.Git.Ignore, b.cfg.Git.IncludeGitignore) {
+			hasChanges = true
+			break
+		}
+	}
+
+	// If no changes, propose current version
+	if !hasChanges {
+		logger.Info().
+			Str("version", b.current.String()).
+			Msg("No changes detected. Using current version.")
+		b.proposed = b.current
+		return b.current.String(), nil
+	}
+
 	// Get file summaries and commit history
 	fileSummaries, err := b.analyzeFiles(ctx)
 	if err != nil {
@@ -281,7 +320,7 @@ func (b *Bumper) updateFile(file config.VersionFile) error {
 
 	// Create backup
 	backupPath := file.Path + ".bak"
-	if err := os.WriteFile(backupPath, content, 0o644); err != nil {
+	if err := os.WriteFile(backupPath, content, filePerms); err != nil {
 		return errors.WrapWithContext(
 			errors.CodeInputError,
 			err,
@@ -297,14 +336,16 @@ func (b *Bumper) updateFile(file config.VersionFile) error {
 	}
 
 	if updated != string(content) {
-		if err := os.WriteFile(file.Path, []byte(updated), 0o644); err != nil {
+		if err := os.WriteFile(file.Path, []byte(updated), filePerms); err != nil {
 			// Attempt to restore backup on failure
-			os.Rename(backupPath, file.Path)
-			return errors.WrapWithContext(
-				errors.CodeInputError,
-				err,
-				errors.FormatContext(errors.ContextFileWrite, file.Path),
-			)
+			if renameErr := os.Rename(backupPath, file.Path); renameErr != nil {
+				return errors.WrapWithContext(
+					errors.CodeIOError,
+					errors.ErrIO,
+					errors.ContextFileRestore,
+				)
+			}
+			return err
 		}
 	}
 
@@ -319,7 +360,7 @@ func (b *Bumper) commitVersionChange(ctx context.Context) error {
 		return nil
 	}
 
-	var files []string
+	files := make([]string, 0, len(b.files))
 	for _, f := range b.files {
 		files = append(files, f.Path)
 	}
@@ -375,7 +416,8 @@ func (b *Bumper) analyzeFiles(ctx context.Context) ([]string, error) {
 		)
 	}
 
-	var fileSummaries []string
+	// Pre-allocate with a reasonable initial capacity
+	fileSummaries := make([]string, 0, len(status)/summaryCapacityRatio)
 	for path, fileStatus := range status {
 		if b.repo.ShouldIgnoreFile(path, b.cfg.Git.Ignore, b.cfg.Git.IncludeGitignore) {
 			continue
@@ -573,11 +615,12 @@ func (b *Bumper) findLastVersionTag() (string, error) {
 func determineCurrentVersion(repo *git.Repository) (*semver.Version, error) {
 	// First try VERSION file
 	if content, err := os.ReadFile("VERSION"); err == nil {
-		if ver, err := semver.NewVersion(strings.TrimSpace(string(content))); err == nil {
-			logger.Debug().
+		versionStr := strings.TrimSpace(string(content))
+		if ver, err := semver.NewVersion(versionStr); err == nil {
+			logger.Info().
 				Str("source", "VERSION file").
 				Str("version", ver.String()).
-				Msg("Found current version")
+				Msg("Current version determined from VERSION file")
 			return ver, nil
 		}
 	}
@@ -593,6 +636,7 @@ func determineCurrentVersion(repo *git.Repository) (*semver.Version, error) {
 	}
 
 	var latestVer *semver.Version
+	var latestTagName string
 	err = refs.ForEach(func(ref *plumbing.Reference) error {
 		if ref.Name().IsTag() {
 			tagName := ref.Name().Short()
@@ -600,10 +644,7 @@ func determineCurrentVersion(repo *git.Repository) (*semver.Version, error) {
 			if ver, err := semver.NewVersion(versionStr); err == nil {
 				if latestVer == nil || ver.GreaterThan(latestVer) {
 					latestVer = ver
-					logger.Debug().
-						Str("tag", tagName).
-						Str("version", ver.String()).
-						Msg("Found version tag")
+					latestTagName = tagName
 				}
 			}
 		}
@@ -618,18 +659,19 @@ func determineCurrentVersion(repo *git.Repository) (*semver.Version, error) {
 	}
 
 	if latestVer != nil {
-		logger.Debug().
+		logger.Info().
 			Str("source", "git tag").
+			Str("tag", latestTagName).
 			Str("version", latestVer.String()).
-			Msg("Using latest version tag")
+			Msg("Current version determined from latest version tag")
 		return latestVer, nil
 	}
 
 	// Start at 0.1.0
 	initial, _ := semver.NewVersion("0.1.0")
-	logger.Debug().
+	logger.Info().
 		Str("source", "default").
 		Str("version", initial.String()).
-		Msg("No existing version found, starting at 0.1.0")
+		Msg("No existing version found, starting at default version 0.1.0")
 	return initial, nil
 }

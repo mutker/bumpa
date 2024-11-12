@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"text/template"
@@ -20,6 +21,7 @@ import (
 // Core constants
 const (
 	ProviderOpenAICompatible = "openai-compatible"
+	splitPartsExpected       = 2
 )
 
 // Core interfaces
@@ -55,7 +57,7 @@ type Message struct {
 
 type MessageResponse struct {
 	Content       string         `json:"content"`
-	FunctionCalls []FunctionCall `json:"tool_calls,omitempty"`
+	FunctionCalls []FunctionCall `json:"tool_calls,omitempty"` //nolint:tagliatelle // Following OpenAI API spec
 }
 
 type MessageChoice struct {
@@ -123,7 +125,6 @@ type FunctionCallArguments struct {
 	Summary               string `json:"summary"`
 }
 
-//nolint:ireturn,nolintlint // Interface return needed for provider flexibility and testing
 func New(cfg *config.LLMConfig) (Client, error) {
 	logger.Debug().
 		Str("provider", cfg.Provider).
@@ -153,6 +154,14 @@ func New(cfg *config.LLMConfig) (Client, error) {
 }
 
 func (c *OpenAIClient) GenerateText(ctx context.Context, systemPrompt, userPrompt string, apiFunctions []APIFunction) (string, error) {
+	if ctx == nil {
+		return "", errors.WrapWithContext(
+			errors.CodeConfigError,
+			errors.ErrInvalidInput,
+			"context cannot be nil",
+		)
+	}
+
 	select {
 	case <-ctx.Done():
 		return "", errors.WrapWithContext(
@@ -169,12 +178,8 @@ func (c *OpenAIClient) GenerateText(ctx context.Context, systemPrompt, userPromp
 		functions := make([]Function, len(apiFunctions))
 		for i, fn := range apiFunctions {
 			functions[i] = Function{
-				Type: "function",
-				Function: FunctionDef{
-					Name:        fn.Name,
-					Description: fn.Description,
-					Parameters:  fn.Parameters,
-				},
+				Type:     "function",
+				Function: apiFunctionToFunctionDef(&fn),
 			}
 		}
 
@@ -397,15 +402,27 @@ func createFunctionDefinition(fn *config.LLMFunction) APIFunction {
 	}
 }
 
+// APIFunction to FunctionDef conversion
+func apiFunctionToFunctionDef(fn *APIFunction) FunctionDef {
+	if fn == nil {
+		return FunctionDef{}
+	}
+	return FunctionDef(*fn)
+}
+
 func processFunctionResponse(response, functionName string) string {
 	if strings.HasPrefix(response, "{") && strings.HasSuffix(response, "}") {
 		var functionResponse struct {
 			Summary string `json:"summary"`
 			Message string `json:"message"`
 			Content string `json:"content"`
+			File    string `json:"file"`
+			Status  string `json:"status"`
+			Diff    string `json:"diff"`
 		}
 
 		if err := json.Unmarshal([]byte(response), &functionResponse); err == nil {
+			// Check fields in priority order
 			if functionResponse.Summary != "" {
 				return functionResponse.Summary
 			}
@@ -414,6 +431,11 @@ func processFunctionResponse(response, functionName string) string {
 			}
 			if functionResponse.Content != "" {
 				return functionResponse.Content
+			}
+
+			// If we have file info but no summary, construct a basic one
+			if functionResponse.File != "" {
+				return "update %s" + filepath.Base(functionResponse.File)
 			}
 		}
 
@@ -549,7 +571,7 @@ func validateFunctionConfig(fn *config.LLMFunction) error {
 
 // Helper functions
 func convertProperties(configProps map[string]config.Property) map[string]Property {
-	properties := make(map[string]Property)
+	properties := make(map[string]Property, len(configProps))
 	for k, v := range configProps {
 		properties[k] = Property{
 			Type:        v.Type,

@@ -17,13 +17,6 @@ import (
 	"codeberg.org/mutker/bumpa/internal/version"
 )
 
-const (
-	commitCommand = "commit"
-	editCommand   = "edit"
-	retryCommand  = "retry"
-	quitCommand   = "quit"
-)
-
 type CommitAction struct {
 	Command string
 	Message string
@@ -118,7 +111,6 @@ func executeCommand(ctx context.Context, cfg *config.Config, llmClient llm.Clien
 	}
 }
 
-//nolint:ireturn // Interface return needed for flexibility and testing
 func initializeLLMClient(cfg *config.Config) (llm.Client, error) {
 	llmClient, err := llm.New(&cfg.LLM)
 	if err != nil {
@@ -135,78 +127,6 @@ func openGitRepository(cfg *config.Config) (*git.Repository, error) {
 	}
 
 	return repo, nil
-}
-
-func promptCommitAction(message string, files []string) (CommitAction, error) {
-	fileList := strings.Join(files, "\n  ")
-	prompt := formatPrompt(fileList, message)
-
-	response, err := getUserResponse(prompt)
-	if err != nil {
-		return CommitAction{Command: quitCommand}, errors.Wrap(errors.CodeInputError, err)
-	}
-
-	action := processCommitResponse(response, message)
-
-	return action, nil
-}
-
-func processCommitResponse(response, originalMessage string) CommitAction {
-	logger.Debug().Str("response", response).Msg("User response")
-	switch response {
-	case "c":
-		return CommitAction{Command: commitCommand, Message: originalMessage}
-	case "e":
-		editedMessage := editContent(originalMessage, "COMMIT")
-		return CommitAction{Command: editCommand, Message: editedMessage}
-	case "r":
-		return CommitAction{Command: retryCommand}
-	default:
-		return CommitAction{Command: quitCommand}
-	}
-}
-
-func processVersionResponse(response, proposed string) VersionAction {
-	logger.Debug().Str("response", response).Msg("User response")
-	switch response {
-	case "a", "c":
-		return VersionAction{Command: commitCommand}
-	case "e":
-		// Let user edit the full version string
-		editedVersion := editContent(proposed, "VERSION")
-		logger.Debug().
-			Str("original", proposed).
-			Str("edited", editedVersion).
-			Msg("Version edited")
-
-		// Split into version and pre-release parts
-		parts := strings.Split(editedVersion, "-")
-		baseVersion := parts[0]
-		var preRelease string
-		if len(parts) > 1 {
-			preRelease = parts[1]
-		}
-
-		// Determine bump type by comparing with current version
-		var bumpType string
-		if strings.HasPrefix(baseVersion, "0.1.0") {
-			bumpType = "minor"
-		} else if strings.HasPrefix(baseVersion, "0.0.2") {
-			bumpType = "patch"
-		} else {
-			bumpType = "" // No change in base version
-		}
-
-		return VersionAction{
-			Command:    editCommand,
-			BumpType:   bumpType,
-			PreRelease: preRelease,
-		}
-	case "r":
-		return VersionAction{Command: retryCommand}
-	default:
-		return VersionAction{Command: quitCommand}
-	}
 }
 
 //nolint:forbidigo // Direct console interaction required
@@ -259,12 +179,6 @@ func editContent(content, prefix string) string {
 	return strings.TrimSpace(string(editedContent))
 }
 
-func formatPrompt(fileList, message string) string {
-	return fmt.Sprintf("Files to commit:\n  %s\n\nCommit message:\n  %s\n\n"+
-		"Do you want to (c)ommit, (e)dit, (r)etry, or (Q)uit? (c/e/r/Q) ", fileList, message)
-}
-
-//nolint:cyclop // Complex function handling git commit workflow
 func runCommit(ctx context.Context, cfg *config.Config, llmClient llm.Client, repo *git.Repository) error {
 	generator, err := commit.NewGenerator(cfg, llmClient, repo)
 	if err != nil {
@@ -314,13 +228,10 @@ func runCommit(ctx context.Context, cfg *config.Config, llmClient llm.Client, re
 
 		case "e": // edit
 			editedMessage := editContent(state.Message, "COMMIT")
-			// Here you might want to validate the edited message
-			// and potentially regenerate if it's invalid
-			state.Message = editedMessage
+			generator.SetManualMessage(editedMessage)
 
 		case "r": // retry
 			// Clear previous state to force regeneration
-			generator = nil
 			generator, err = commit.NewGenerator(cfg, llmClient, repo)
 			if err != nil {
 				return errors.Wrap(errors.CodeGitError, err)
@@ -481,15 +392,7 @@ func buildVersionPrompt(state *version.WorkflowState) string {
 		}
 	}
 
-	actionWord := "commit"
-	actionLetter := "c"
-	if !state.NeedsCommit {
-		actionWord = "apply"
-		actionLetter = "a"
-	}
-
-	prompt.WriteString(fmt.Sprintf("\nDo you want to %s, (e)dit, (r)etry, or (Q)uit? (%s/e/r/Q) ",
-		actionWord, actionLetter))
+	prompt.WriteString("\nDo you want to (c)ommit, (e)dit, (r)etry, or (Q)uit? (c/e/r/Q) ")
 
 	return prompt.String()
 }

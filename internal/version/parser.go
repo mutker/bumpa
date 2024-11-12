@@ -8,6 +8,15 @@ import (
 	"github.com/Masterminds/semver/v3"
 )
 
+const (
+	splitPartsExpected = 2
+	// Version bump types
+	bumpTypeMajor = "major"
+	bumpTypeMinor = "minor"
+	bumpTypePatch = "patch"
+	bumpTypeNone  = ""
+)
+
 // Parser handles semantic version parsing and validation
 type Parser struct {
 	currentVersion   *semver.Version
@@ -26,7 +35,7 @@ func New(current *semver.Version, breakingKeywords, featureKeywords []string) *P
 
 // ParseSuggestion parses a version suggestion string into bump type and prerelease components.
 // Accepts both full versions (e.g., "1.2.3-beta1") and simple formats (e.g., "minor:beta1" or "beta2")
-func (p *Parser) ParseSuggestion(suggestion string) (bumpType, preRelease string, err error) {
+func (p *Parser) ParseSuggestion(suggestion string) (string, string, error) {
 	suggestion = strings.TrimSpace(suggestion)
 
 	// Handle full version format (e.g., "0.1.0-beta1")
@@ -35,11 +44,11 @@ func (p *Parser) ParseSuggestion(suggestion string) (bumpType, preRelease string
 	}
 
 	// Handle simple format (e.g., "minor:beta1" or "beta2")
-	return p.parseSimpleFormat(suggestion)
+	return p.parseSimpleVersion(suggestion)
 }
 
 // parseFullVersion parses a complete version string (e.g., "1.2.3-beta1")
-func (p *Parser) parseFullVersion(version string) (bumpType, preRelease string, err error) {
+func (p *Parser) parseFullVersion(version string) (string, string, error) {
 	ver, err := semver.NewVersion(version)
 	if err != nil {
 		return "", "", errors.WrapWithContext(
@@ -49,8 +58,8 @@ func (p *Parser) parseFullVersion(version string) (bumpType, preRelease string, 
 		)
 	}
 
-	preRelease = ver.Prerelease()
-	if preRelease != "" && !p.isValidPrerelease(preRelease) {
+	preRelease := ver.Prerelease()
+	if preRelease != "" && !isValidPrerelease(preRelease) {
 		return "", "", errors.WrapWithContext(
 			errors.CodeValidateError,
 			errors.ErrInvalidInput,
@@ -58,25 +67,42 @@ func (p *Parser) parseFullVersion(version string) (bumpType, preRelease string, 
 		)
 	}
 
-	bumpType = p.determineBumpType(ver)
+	bumpType := p.determineBumpType(ver)
 	return bumpType, preRelease, nil
 }
 
-// parseSimpleFormat parses a simplified version format (e.g., "minor:beta1" or "beta2")
-func (p *Parser) parseSimpleFormat(suggestion string) (bumpType, preRelease string, err error) {
+// parseSimpleVersion parses a simplified version format (e.g., "minor:beta1" or "beta2")
+func (*Parser) parseSimpleVersion(suggestion string) (string, string, error) {
 	parts := strings.Split(suggestion, ":")
 
 	switch len(parts) {
-	case 2:
-		bumpType = strings.TrimSpace(parts[0])
-		preRelease = strings.TrimSpace(parts[1])
+	case splitPartsExpected:
+		bumpType := strings.TrimSpace(parts[0])
+		preRelease := strings.TrimSpace(parts[1])
+		if err := validateBumpType(bumpType); err != nil {
+			return "", "", err
+		}
+		if preRelease != "" && !isValidPrerelease(preRelease) {
+			return "", "", errors.WrapWithContext(
+				errors.CodeValidateError,
+				errors.ErrInvalidInput,
+				errors.FormatContext(errors.ContextVersionPreRelease, preRelease),
+			)
+		}
+		return bumpType, preRelease, nil
 	case 1:
 		suggestion = strings.TrimSpace(parts[0])
 		if suggestion == "stable" {
-			preRelease = ""
-		} else {
-			preRelease = suggestion
+			return bumpTypeNone, "", nil
 		}
+		if !isValidPrerelease(suggestion) {
+			return "", "", errors.WrapWithContext(
+				errors.CodeValidateError,
+				errors.ErrInvalidInput,
+				errors.FormatContext(errors.ContextVersionPreRelease, suggestion),
+			)
+		}
+		return bumpTypeNone, suggestion, nil
 	default:
 		return "", "", errors.WrapWithContext(
 			errors.CodeValidateError,
@@ -84,26 +110,12 @@ func (p *Parser) parseSimpleFormat(suggestion string) (bumpType, preRelease stri
 			errors.ContextVersionInvalid,
 		)
 	}
-
-	if err := p.validateBumpType(bumpType); err != nil {
-		return "", "", err
-	}
-
-	if preRelease != "" && !p.isValidPrerelease(preRelease) {
-		return "", "", errors.WrapWithContext(
-			errors.CodeValidateError,
-			errors.ErrInvalidInput,
-			errors.FormatContext(errors.ContextVersionPreRelease, preRelease),
-		)
-	}
-
-	return bumpType, preRelease, nil
 }
 
-// validateBumpType ensures the bump type is one of: major, minor, patch, or empty
-func (p *Parser) validateBumpType(bumpType string) error {
+// validateBumpType ensures the bump type is valid
+func validateBumpType(bumpType string) error {
 	switch bumpType {
-	case "major", "minor", "patch", "":
+	case bumpTypeMajor, bumpTypeMinor, bumpTypePatch, bumpTypeNone:
 		return nil
 	default:
 		return errors.WrapWithContext(
@@ -115,7 +127,7 @@ func (p *Parser) validateBumpType(bumpType string) error {
 }
 
 // isValidPrerelease checks if the prerelease suffix matches the pattern: alpha|beta|rc + number
-func (p *Parser) isValidPrerelease(preRelease string) bool {
+func isValidPrerelease(preRelease string) bool {
 	return regexp.MustCompile(`^(alpha|beta|rc)\d+$`).MatchString(preRelease)
 }
 
@@ -123,13 +135,13 @@ func (p *Parser) isValidPrerelease(preRelease string) bool {
 func (p *Parser) determineBumpType(proposed *semver.Version) string {
 	switch {
 	case proposed.Major() > p.currentVersion.Major():
-		return "major"
+		return bumpTypeMajor
 	case proposed.Minor() > p.currentVersion.Minor():
-		return "minor"
+		return bumpTypeMinor
 	case proposed.Patch() > p.currentVersion.Patch():
-		return "patch"
+		return bumpTypePatch
 	default:
-		return ""
+		return bumpTypeNone
 	}
 }
 
@@ -145,11 +157,11 @@ func ProposeVersion(current *semver.Version, bumpType, preRelease string) (*semv
 
 	var newVersion semver.Version
 	switch bumpType {
-	case "major":
+	case bumpTypeMajor:
 		newVersion = current.IncMajor()
-	case "minor":
+	case bumpTypeMinor:
 		newVersion = current.IncMinor()
-	case "patch":
+	case bumpTypePatch:
 		newVersion = current.IncPatch()
 	default:
 		newVersion = *current

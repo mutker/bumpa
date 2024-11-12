@@ -16,7 +16,7 @@ llm:
   provider: openai-compatible
   model: llama3.1:latest
   base_url: http://localhost:11434/v1
-  # api_key: optional, only needed for some providers like OpenAI or Groq
+  # api_key: optional
   max_retries: 3
   request_timeout: 30s
   commit_msg_timeout: 30s
@@ -27,68 +27,145 @@ git:
     - "go.mod"
     - "go.sum"
     - "*.log"
-    - "TODO.md"
   max_diff_lines: 10
   preferred_line_length: 72 # Standard git commit message length
 
 version:
   git:
-    commit: false # Whether to create version bump commits
-    tag: true # Whether to create version tags
-    signage: true # Whether to sign git tags
-  files: # Files to update with new version
-    - path: "VERSION" # Simple version file
+    commit: false
+    tag: true
+    signage: true
+  files:
+    - path: "VERSION"
       replace:
-        - "{version}" # Replace exact version string
-    - path: "pkg/version/version.go" # Go source file
+        - "{version}"
+    - path: "pkg/version/version.go"
       replace:
-        - 'const Version = "{version}"' # Replace version in const declaration
-    - path: "package.json" # npm package file
+        - 'const Version = "{version}"'
+    - path: "package.json"
       replace:
-        - '"version": "{version}"' # Replace in version field
-    - path: "pyproject.toml" # Python project file
+        - '"version": "{version}"'
+    - path: "pyproject.toml"
       replace:
-        - 'version = "{version}"' # Replace in version field
+        - 'version = "{version}"'
 
 functions:
+  - name: "analyze_version_bump"
+    description: "Analyze changes and suggest semantic version bump type and prerelease stage"
+    parameters:
+      type: "object"
+      properties:
+        current_version:
+          type: "string"
+          description: "Current semantic version including any prerelease suffix"
+        file_changes:
+          type: "string"
+          description: "Summary of file changes"
+        commit_history:
+          type: "string"
+          description: "Relevant commit messages since last version"
+        breaking_keywords:
+          type: "array"
+          description: "Keywords indicating breaking changes"
+          items:
+            type: "string"
+        feature_keywords:
+          type: "array"
+          description: "Keywords indicating new features"
+          items:
+            type: "string"
+      required: ["current_version", "file_changes", "commit_history"]
+    system_prompt: |
+      You are a semantic versioning expert. Return EXACTLY ONE LINE containing the version progression suggestion.
+
+      Valid Response Formats:
+      major:alpha1
+      minor:alpha1
+      patch:alpha1
+      alpha2
+      beta1
+      rc1
+      stable
+
+      NO OTHER TEXT OR EXPLANATION ALLOWED.
+
+      Version Progression Rules:
+      1. New Project Start (0.x.x):
+          - Start with 0.1.0-alpha1
+          - Progress through alpha/beta/rc to 0.1.0
+          - Continue with 0.2.0-alpha1 for major changes
+
+      2. Pre-1.0 Development:
+          - Use alpha for initial implementation
+          - Use beta for feature-complete testing
+          - Use rc when preparing for release
+          - Progress to stable when production-ready
+
+      3. Post-1.0 Development:
+          - Major changes start at alpha1
+          - Progress through stages based on stability
+          - Multiple alphas/betas allowed before rc
+          - RC indicates release readiness
+
+      Stage Transition Guidelines:
+      - alpha → beta: Feature complete, needs testing
+      - beta → rc: Code complete, final testing
+      - rc → stable: No significant issues found
+      - Stay in current stage if more work needed
+
+      REMEMBER: Return ONLY the version suggestion, nothing else.
+    user_prompt: |
+      Analyze these changes and suggest version progression.
+      Current version: {{.current_version}}
+
+      File Changes:
+      {{.file_changes}}
+
+      Commit History:
+      {{.commit_history}}
+
+      Breaking change keywords: {{.breaking_keywords}}
+      Feature keywords: {{.feature_keywords}}
+
   - name: "generate_file_summary"
-    type: "function"
-    function:
-      name: "generate_file_summary"
-      description: "Analyze git file changes and provide a concise summary"
-      parameters:
-        type: "object"
-        properties:
-          file:
-            type: "string"
-            description: "The path of the file"
-          status:
-            type: "string"
-            description: "The git status of the file"
-            enum: ["A", "M", "D", "R", "C"] # Standard git status codes
-          diff:
-            type: "string"
-            description: "The git diff content"
-          hasSignificantChanges:
-            type: "boolean"
-            description: "Whether there are significant non-import changes"
-        required: ["file", "status", "diff", "hasSignificantChanges"]
+    description: "Analyze git file changes and provide a concise summary"
+    parameters:
+      type: "object"
+      properties:
+        file:
+          type: "string"
+          description: "The path of the file"
+        status:
+          type: "string"
+          description: "The git status of the file"
+          enum: ["A", "M", "D", "R", "C"]
+        diff:
+          type: "string"
+          description: "The git diff content"
+        hasSignificantChanges:
+          type: "boolean"
+          description: "Whether there are significant non-import changes"
+      required: ["file", "status", "diff", "hasSignificantChanges"]
     system_prompt: |
       You are a code review assistant specializing in summarizing Git changes.
       Your task is to analyze changes and provide clear, informative summaries.
 
       Rules:
-      1. Provide a clear, concise, single-sentence summary
-      2. Focus on what changed, not how or why
-      3. For significant changes, describe the main functionality change
-      4. For minor changes, use phrases like "minor improvements" or "formatting updates"
-      5. Never suggest improvements or alternatives
-      6. Keep summaries factual and objective
+      1. Provide a VERY concise summary under 40 characters
+      2. Focus on the core change only
+      3. Use simple, direct language
+      4. Never include file paths
+      5. Never use punctuation at the end
+      6. For minor changes, use standard phrases:
+            - "update logging format"
+            - "improve error handling"
+            - "fix formatting"
+            - "update documentation"
 
       Examples:
-      - "Add user authentication middleware with JWT support"
-      - "Update logging format to include trace IDs"
-      - "Minor formatting improvements and comment updates"
+        - "add JWT authentication"
+        - "update logging format"
+        - "improve error handling"
     user_prompt: |
       Provide a concise summary of the following file changes:
       File: {{.file}}
@@ -97,56 +174,41 @@ functions:
       {{.diff}}
 
   - name: "generate_commit_message"
-    type: "function"
-    function:
-      name: "generate_commit_message"
-      description: "Generate a conventional commit message"
-      parameters:
-        type: "object"
-        properties:
-          summary:
-            type: "string"
-            description: "Summary of all file changes"
-          branch:
-            type: "string"
-            description: "The current git branch name"
-        required: ["summary", "branch"]
+    description: "Generate a conventional commit message"
+    parameters:
+      type: "object"
+      properties:
+        summary:
+          type: "string"
+          description: "Summary of all file changes"
+        branch:
+          type: "string"
+          description: "The current git branch name"
+      required: ["summary", "branch"]
     system_prompt: |
-      You are a Conventional Commits expert. Generate a commit message following these exact rules:
+      You are a Conventional Commits expert. Generate a commit message following these EXACT rules:
 
-      Header format (MUST BE): type(scope): description
-      Example: fix(errors): improve error handling and validation
+      FORMAT:
+      <type>(<scope>): <description>
 
-      Rules:
-      1. Type MUST be one of:
-         feat|fix|docs|style|refactor|perf|test|chore|ci|build
-      2. Scope MUST be:
-         - In parentheses
-         - Lowercase
-         - Single word or hyphenated
-         - Related to the primary component being changed
-      3. Description MUST be:
-         - Separated from type(scope) by ": " (colon and single space)
-         - Lowercase
-         - No period at end
-         - Under 72 chars total
-         - Use imperative: "add" not "added"
-         - Clear and concise
+      WHERE:
+      - type: feat|fix|docs|style|refactor|perf|test|chore|ci|build
+      - scope: single lowercase word
+      - description: imperative, lowercase, no period, max 40 chars
 
-      For multiple file changes:
-      1. Header summarizes primary change
-      2. Add body after two newlines
-      3. Group related changes in body
-      4. Example:
-         fix(config): improve error handling and validation
+      TOTAL LENGTH MUST BE UNDER 72 CHARS
 
-         * config: add validation for required fields
-         * errors: centralize error definitions
-         * logger: improve error context logging
+      ALWAYS use this pattern:
+      1. Choose most specific type
+      2. Use shortest clear scope
+      3. Keep description brief
 
-         Additional updates:
-         * Update linter configuration
-         * Fix formatting in various files
+      VALID EXAMPLES:
+      refactor(llm): update message handling
+      fix(config): improve validation
+      style(fmt): update code formatting
+
+      REMEMBER: Exactly one space after colon, no space before colon
     user_prompt: |
       Generate a commit message following the exact format above:
       Branch: {{.branch}}
@@ -155,53 +217,52 @@ functions:
       {{.summary}}
 
   - name: "retry_commit_message"
-    type: "function"
-    function:
-      name: "retry_commit_message"
-      description: "Generate a commit message, learning from previous invalid attempt"
-      parameters:
-        type: "object"
-        properties:
-          summary:
-            type: "string"
-            description: "Summary of all file changes"
-          branch:
-            type: "string"
-            description: "The current git branch name"
-          previous:
-            type: "string"
-            description: "The previous invalid commit message"
-          error:
-            type: "string"
-            description: "The reason the previous attempt was invalid"
-        required: ["summary", "branch", "previous", "error"]
+    description: "Generate a commit message, learning from previous invalid attempt"
+    parameters:
+      type: "object"
+      properties:
+        summary:
+          type: "string"
+          description: "Summary of all file changes"
+        branch:
+          type: "string"
+          description: "The current git branch name"
+        previous:
+          type: "string"
+          description: "The previous invalid commit message"
+        error:
+          type: "string"
+          description: "The reason the previous attempt was invalid"
+      required: ["summary", "branch", "previous", "error"]
     system_prompt: |
-      You are a Conventional Commits expert. Previous attempt failed: {{.error}}
+      Previous attempt failed because: {{.error}}
 
-      CRITICAL RULES:
-      1. TOTAL header length MUST be under 72 chars
-      2. Format MUST be: type(scope): description
-         - Exactly ONE space after colon
-         - No space before colon
-      3. Type MUST be one of: feat|fix|docs|style|refactor|perf|test|chore|ci|build
-      4. Scope MUST be single word, lowercase component name
-      5. Description MUST be under 40 chars
+      STRICT FORMAT:
+      <type>(<scope>): <description>
 
-      Character count examples:
-      refactor(llm): update message structure     # 39 chars ✓
-      fix(errors): improve handling patterns      # 41 chars ✓
-      style(config): reorganize fields           # 35 chars ✓
+      RULES:
+      1. ALWAYS use this exact pattern
+      2. NO variations allowed
+      3. ONE space after colon
+      4. NO space before colon
+      5. Total length under 72 chars
+      6. Description under 40 chars
 
-      Previous attempts (invalid):
-      {{.previous}}                              # Too long/wrong format
+      VALID:
+      refactor(llm): update message format
+      fix(log): improve error handling
+      style(fmt): update formatting
 
-      Focus on MOST IMPORTANT change only!
-      - Use shortest clear scope
-      - Keep description brief but clear
-      - Count total characters before submitting
+      INVALID:
+      refactor(llm):update format     # missing space after colon
+      fix(log) : improve handling     # space before colon
+      style(fmt): update all code formatting in multiple files  # too long
     user_prompt: |
       Generate a short, focused commit message for the MAIN change only.
       Branch: {{.branch}}
 
       Primary changes (pick one):
       {{.summary}}
+
+      Previous attempt: {{.previous}}
+      Error: {{.error}}

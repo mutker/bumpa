@@ -31,12 +31,12 @@ const (
 )
 
 type Config struct {
-	Logging   LoggingConfig
-	Git       GitConfig
-	LLM       LLMConfig
+	Logging   LoggingConfig `mapstructure:"logging"`
+	Git       GitConfig     `mapstructure:"git"`
+	LLM       LLMConfig     `mapstructure:"llm"`
 	Functions []LLMFunction `mapstructure:"functions"`
-	Command   string
-	Version   VersionConfig `yaml:"version"`
+	Command   string        `mapstructure:"command"`
+	Version   VersionConfig `mapstructure:"version"`
 	NoConfirm bool          `mapstructure:"no_confirm"`
 }
 
@@ -44,14 +44,13 @@ type GitConfig struct {
 	IncludeGitignore    bool     `mapstructure:"include_gitignore"`
 	Ignore              []string `mapstructure:"ignore"`
 	MaxDiffLines        int      `mapstructure:"max_diff_lines"`
-	PreferredLineLength int      `mapstructure:"preferredLineLength"`
+	PreferredLineLength int      `mapstructure:"preferred_line_length"`
 }
 
 type CLIConfig struct {
 	Command string
 }
 
-// LoggingConfig represents logging configuration from config file
 type LoggingConfig struct {
 	Environment  string              `mapstructure:"environment"`
 	TimeFormat   string              `mapstructure:"timeformat"`
@@ -98,19 +97,20 @@ type FunctionParameters struct {
 }
 
 type Property struct {
-	Type        string   `mapstructure:"type"           yaml:"type"`
-	Description string   `mapstructure:"description"    yaml:"description"`
-	Enum        []string `mapstructure:"enum,omitempty" yaml:"enum,omitempty"`
+	Type        string    `mapstructure:"type"           yaml:"type"`
+	Description string    `mapstructure:"description"    yaml:"description"`
+	Enum        []string  `mapstructure:"enum,omitempty" yaml:"enum,omitempty"`
+	Items       *Property `mapstructure:"items,omitempty" yaml:"items,omitempty"`
 }
 
 type VersionConfig struct {
-	Current    string        `yaml:"current"`
-	Git        VersionGit    `yaml:"git"`
-	Prerelease []string      `yaml:"prerelease"`
-	Files      []VersionFile `yaml:"files"`
-	Alpha      bool          `yaml:"alpha"`
-	Beta       bool          `yaml:"beta"`
-	RC         bool          `yaml:"rc"`
+	Current    string        `mapstructure:"current"`
+	Git        VersionGit    `mapstructure:"git"`
+	Prerelease []string      `mapstructure:"prerelease"`
+	Files      []VersionFile `mapstructure:"files"`
+	Alpha      bool          `mapstructure:"alpha"`
+	Beta       bool          `mapstructure:"beta"`
+	RC         bool          `mapstructure:"rc"`
 }
 
 type VersionGit struct {
@@ -137,7 +137,7 @@ func Load() (*Config, error) {
 	viper.SetConfigType("yaml")
 	viper.AddConfigPath(".")
 
-	setDefaults()
+	SetDefaults()
 
 	if err := viper.ReadInConfig(); err != nil {
 		var configFileNotFound viper.ConfigFileNotFoundError
@@ -154,6 +154,9 @@ func Load() (*Config, error) {
 
 	var cfg Config
 	if err := viper.Unmarshal(&cfg); err != nil {
+		logger.Error().
+			Err(err).
+			Msg("Failed to unmarshal configuration")
 		return nil, errors.WrapWithContext(
 			errors.CodeConfigError,
 			err,
@@ -161,11 +164,11 @@ func Load() (*Config, error) {
 		)
 	}
 
-	// Apply debug mode if enabled
-	// cfg.Logging.ApplyDebugMode()
-
 	// Validate configuration
 	if err := validateConfig(&cfg); err != nil {
+		logger.Error().
+			Err(err).
+			Msg("Configuration validation failed")
 		return nil, err
 	}
 
@@ -186,12 +189,24 @@ func LoadInitialLogging() (*LoggingConfig, error) {
 	viper.SetEnvKeyReplacer(strings.NewReplacer(".", "_"))
 
 	// Bind logging-related environment variables
-	viper.BindEnv("logging.level")
-	viper.BindEnv("logging.environment")
-	viper.BindEnv("logging.output")
-	viper.BindEnv("logging.timeformat")
+	envVars := []string{
+		"logging.level",
+		"logging.environment",
+		"logging.output",
+		"logging.timeformat",
+	}
 
-	setDefaults()
+	for _, env := range envVars {
+		if err := viper.BindEnv(env); err != nil {
+			return nil, errors.WrapWithContext(
+				errors.CodeConfigError,
+				err,
+				"failed to bind environment variable: %s"+env,
+			)
+		}
+	}
+
+	SetDefaults()
 
 	// Validate log level
 	logLevel := viper.GetString("logging.level")
@@ -461,7 +476,7 @@ func ParseFlags(cfg *Config) error {
 	return nil
 }
 
-func setDefaults() {
+func SetDefaults() {
 	viper.SetDefault("llm.provider", "openai-compatible")
 	viper.SetDefault("llm.model", "llama3.1:latest")
 	viper.SetDefault("llm.base_url", "http://localhost:11434/v1")
@@ -473,11 +488,18 @@ func setDefaults() {
 	viper.SetDefault("logging.timeformat", TimeFormatRFC3339)
 	viper.SetDefault("logging.output", "console")
 	viper.SetDefault("logging.level", "info")
-	viper.SetDefault("logging.file_perms", DefaultLogFilePerms)
-	viper.SetDefault("logging.dir_perms", DefaultLogDirPerms)
+	viper.SetDefault("logging.file_perms", int(DefaultLogFilePerms))
+	viper.SetDefault("logging.dir_perms", int(DefaultLogDirPerms))
 	viper.SetDefault("git.include_gitignore", true)
 	viper.SetDefault("git.max_diff_lines", DefaultMaxDiffLines)
 	viper.SetDefault("git.preferred_line_length", DefaultLineLength)
+
+	// Add defaults for version config
+	viper.SetDefault("version.current", "0.1.0")
+	viper.SetDefault("version.alpha", false)
+	viper.SetDefault("version.beta", false)
+	viper.SetDefault("version.rc", false)
+	viper.SetDefault("no_confirm", false)
 
 	// Add environment variable mappings
 	envMappings := map[string]string{

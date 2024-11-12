@@ -47,7 +47,7 @@
 ### Workflow
 1. User input (cmd/bumpa)
 2. Domain logic (internal/*)
-3. Results presentation (cmd/bumpa)### Log Levels
+3. Results presentation (cmd/bumpa)
 
 ### Log Levels
 

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"regexp"
 	"strings"
+	"time"
 
 	"codeberg.org/mutker/bumpa/internal/config"
 	"codeberg.org/mutker/bumpa/internal/errors"
@@ -16,13 +17,26 @@ import (
 )
 
 const (
-	maxHeaderLength = 72 // Maximum length of commit message header
+	// Commit message components
+	validVerbs = `add|update|remove|fix|refactor|implement|improve|change|modify|delete|revert|merge`
+	validTypes = `feat|fix|docs|style|refactor|perf|test|chore|ci|build`
+	validScope = `[a-z][a-z0-9-]*`
+
+	maxHeaderLength  = 72 // Maximum length of commit message header
+	headerPartCount  = 2  // Number of parts in commit header split
+	lineNumberOffset = 3  // Offset for human-readable line numbers
+	colonWithSpace   = ": "
 )
 
-// Valid commit types
-var validTypes = []string{
-	"feat", "fix", "docs", "style", "refactor",
-	"perf", "test", "chore", "ci", "build",
+// Valid commit patterns
+var commitPatterns = struct {
+	typeScope   string
+	description string
+	header      string
+}{
+	typeScope:   fmt.Sprintf(`^(%s)(\(%s\))?$`, validTypes, validScope),
+	description: fmt.Sprintf(`^(%s)[-a-z0-9 ]*[a-z0-9]$`, validVerbs),
+	header:      fmt.Sprintf(`^(%s)(\(%s\))?: [a-z][-a-z0-9 ]*[a-z0-9]$`, validTypes, validScope),
 }
 
 // WorkflowState represents the current state of commit generation
@@ -31,18 +45,27 @@ type WorkflowState struct {
 	Files          []string // Files to be committed
 	HasChanges     bool     // Whether there are changes to commit
 	IsMessageValid bool     // Whether the generated message is valid
-	RetryCount     int      // Number of generation attempts
+	RetryCount     int      // Number of generation retries
 	LastError      string   // Last error encountered
 	CanCommit      bool     // Whether commit is possible
+	ManuallyEdited bool     // Whether message was manually edited
 }
 
 // Commit manages commit message generation
 type Commit struct {
-	cfg       *config.Config
-	llm       llm.Client
-	repo      *git.Repository
-	files     []string
-	lastError error
+	cfg                *config.Config
+	llm                llm.Client
+	repo               *git.Repository
+	lastError          error
+	generatedMessage   string
+	manualMessage      string
+	messageGeneratedAt time.Time
+}
+
+// CommitValidationResult holds the validation state and any error message
+type CommitValidationResult struct {
+	Valid   bool
+	Message string
 }
 
 // NewGenerator creates a new commit message generator
@@ -67,24 +90,44 @@ func (g *Commit) GetWorkflowState(ctx context.Context) (*WorkflowState, error) {
 		return nil, err
 	}
 
+	// If a manual message exists, use it
+	if g.manualMessage != "" {
+		isValid := g.isValidCommitMessage(g.manualMessage)
+		return &WorkflowState{
+			Message:        g.manualMessage,
+			Files:          files,
+			HasChanges:     len(files) > 0,
+			IsMessageValid: isValid,
+			RetryCount:     0,
+			LastError:      "",
+			CanCommit:      isValid && len(files) > 0,
+		}, nil
+	}
+
 	// Generate message if not already generated
 	var message string
 	var isValid bool
 	var lastError string
-	var retryCount int // Initialize retry count
+	var retryCount int
 
 	if g.lastError != nil {
 		lastError = g.lastError.Error()
 	}
 
 	// If no message has been generated yet, attempt to generate
-	if message == "" {
+	if g.generatedMessage == "" {
 		message, err = g.Generate(ctx)
 		if err != nil {
 			lastError = err.Error()
 		} else {
+			g.generatedMessage = message
+			g.messageGeneratedAt = time.Now()
 			isValid = g.isValidCommitMessage(message)
 		}
+	} else {
+		// Use previously generated message
+		message = g.generatedMessage
+		isValid = g.isValidCommitMessage(message)
 	}
 
 	return &WorkflowState{
@@ -96,6 +139,11 @@ func (g *Commit) GetWorkflowState(ctx context.Context) (*WorkflowState, error) {
 		LastError:      lastError,
 		CanCommit:      isValid && len(files) > 0,
 	}, nil
+}
+
+// GetFilesToUpdate returns paths of files that will be updated/committed
+func (g *Commit) GetFilesToUpdate() ([]string, error) {
+	return g.repo.GetFilesToCommit()
 }
 
 func (g *Commit) Generate(ctx context.Context) (string, error) {
@@ -315,14 +363,13 @@ func (g *Commit) getFileSummaries(ctx context.Context) (map[string]string, error
 		return nil, errors.WrapWithContext(
 			errors.CodeNoChanges,
 			errors.ErrInvalidInput,
-			"no changes are staged for commit - use 'git add' to stage files",
+			"no changes are staged for commit, use 'git add' to stage files",
 		)
 	}
 
 	return fileSummaries, nil
 }
 
-//nolint:cyclop // Complex function handling commit message generation
 func (g *Commit) getCommitMessage(ctx context.Context, summary string) (string, error) {
 	select {
 	case <-ctx.Done():
@@ -399,7 +446,7 @@ func (g *Commit) getCommitMessage(ctx context.Context, summary string) (string, 
 				lastMessage = message
 				lastError = invalid
 
-				logger.Debug().
+				logger.Error().
 					Str("message", message).
 					Str("error", lastError).
 					Int("attempt", retries+1).
@@ -429,96 +476,73 @@ func (g *Commit) getCommitMessage(ctx context.Context, summary string) (string, 
 	}
 }
 
-//nolint:cyclop // Complexity justified by nature of validation logic
-func (g *Commit) analyzeInvalidMessage(message string) string {
+// ValidateCommitMessage handles all commit message validation with detailed feedback
+func (g *Commit) ValidateCommitMessage(message string) CommitValidationResult {
 	if message == "" {
-		return "empty message"
+		return CommitValidationResult{Valid: false, Message: "empty message"}
 	}
 
 	lines := strings.Split(message, "\n")
 	header := lines[0]
 
-	// Check length
 	if len(header) > maxHeaderLength {
-		return fmt.Sprintf("header too long (%d chars, max %d)", len(header), maxHeaderLength)
-	}
-
-	// Check for colon
-	if !strings.Contains(header, ":") {
-		return "missing colon separator"
-	}
-
-	parts := strings.SplitN(header, ":", 2)
-	typeAndScope := parts[0]
-	description := ""
-	if len(parts) > 1 {
-		description = parts[1] // Include full description
-	}
-
-	// Check spacing after colon
-	if len(description) == 0 || description[0] != ' ' {
-		return "must have exactly one space after colon"
-	}
-	description = strings.TrimSpace(description)
-
-	// Check type
-	validTypes := []string{
-		"feat", "fix", "docs", "style", "refactor",
-		"perf", "test", "chore", "ci", "build",
-	}
-	hasValidType := false
-	for _, t := range validTypes {
-		if strings.HasPrefix(typeAndScope, t) {
-			hasValidType = true
-			break
-		}
-	}
-	if !hasValidType {
-		return fmt.Sprintf("invalid type '%s', must be one of: %s",
-			typeAndScope, strings.Join(validTypes, ", "))
-	}
-
-	// Check scope format
-	if strings.Contains(typeAndScope, "(") {
-		if !strings.HasSuffix(typeAndScope, ")") {
-			return "malformed scope - missing closing parenthesis"
-		}
-		scope := strings.TrimSuffix(strings.TrimPrefix(
-			typeAndScope[strings.Index(typeAndScope, "("):],
-			"(",
-		), ")")
-		if scope == "" {
-			return "empty scope"
-		}
-		if !regexp.MustCompile(`^[a-z][a-z0-9-]*$`).MatchString(scope) {
-			return "scope must be lowercase and may only contain letters, numbers, and hyphens"
+		logger.Warn().
+			Str("header", header).
+			Int("length", len(header)).
+			Int("max_length", maxHeaderLength).
+			Msg("Commit message header exceeds maximum length")
+		return CommitValidationResult{
+			Valid:   false,
+			Message: fmt.Sprintf("header too long (%d chars, max %d)", len(header), maxHeaderLength),
 		}
 	}
 
-	// Check description
-	if description == "" {
-		return "missing description"
+	parts := strings.SplitN(header, ":", headerPartCount)
+	if len(parts) != headerPartCount {
+		return CommitValidationResult{Valid: false, Message: "missing colon separator"}
 	}
+
+	typeAndScope := strings.TrimSpace(parts[0])
+	description := strings.TrimSpace(parts[1])
+
+	// Space after colon validation
+	if !strings.HasPrefix(parts[1], " ") || strings.HasPrefix(parts[1], "  ") {
+		return CommitValidationResult{Valid: false, Message: "must have exactly one space after colon"}
+	}
+
+	// Type and scope validation
+	if !regexp.MustCompile(commitPatterns.typeScope).MatchString(typeAndScope) {
+		logger.Debug().
+			Str("type_and_scope", typeAndScope).
+			Str("pattern", commitPatterns.typeScope).
+			Msg("Invalid type or scope format")
+		return CommitValidationResult{Valid: false, Message: fmt.Sprintf("invalid type or scope format in '%s'", typeAndScope)}
+	}
+
+	// Description validation
 	if strings.HasSuffix(description, ".") {
-		return "description ends with period"
-	}
-	if strings.ToLower(description) != description {
-		return "description must be lowercase"
-	}
-	if !regexp.MustCompile(`^[a-z][-a-z0-9 ]*[a-z0-9]$`).MatchString(description) {
-		return "description must start with lowercase letter, end with letter/number, " +
-			"and contain only lowercase letters, numbers, spaces, and hyphens"
+		return CommitValidationResult{Valid: false, Message: "description ends with period"}
 	}
 
-	// Check body format
+	if !regexp.MustCompile(commitPatterns.description).MatchString(description) {
+		logger.Debug().
+			Str("description", description).
+			Str("pattern", commitPatterns.description).
+			Msg("Invalid description format")
+		return CommitValidationResult{Valid: false, Message: "description must start with " +
+			"valid verb and contain only lowercase letters, numbers, spaces, and hyphens"}
+	}
+
+	// Body validation
 	if len(lines) > 1 {
 		if len(lines) > 2 && lines[1] != "" {
-			return "must have blank line after header"
+			return CommitValidationResult{Valid: false, Message: "must have blank line after header"}
 		}
+
 		for i, line := range lines[2:] {
 			if len(line) > g.cfg.Git.PreferredLineLength {
 				logger.Warn().
-					Int("line_number", i+3).
+					Int("line_number", i+lineNumberOffset).
 					Str("line", line).
 					Int("preferred_length", g.cfg.Git.PreferredLineLength).
 					Int("actual_length", len(line)).
@@ -527,7 +551,12 @@ func (g *Commit) analyzeInvalidMessage(message string) string {
 		}
 	}
 
-	return ""
+	return CommitValidationResult{Valid: true}
+}
+
+func (g *Commit) analyzeInvalidMessage(message string) string {
+	result := g.ValidateCommitMessage(message)
+	return result.Message
 }
 
 func (*Commit) filterImportChanges(diff string) (string, bool) {
@@ -559,99 +588,23 @@ func (*Commit) filterImportChanges(diff string) (string, bool) {
 	return strings.Join(filteredLines, "\n"), significantChanges
 }
 
-//nolint:cyclop // Complex function handling multiple validation steps
 func (g *Commit) isValidCommitMessage(message string) bool {
-	lines := strings.Split(message, "\n")
-	if len(lines) == 0 || strings.TrimSpace(lines[0]) == "" {
-		return false
+	result := g.ValidateCommitMessage(message)
+	if !result.Valid {
+		logger.Warn().
+			Str("message", message).
+			Str("error", result.Message).
+			Msg("Invalid commit message")
 	}
+	return result.Valid
+}
 
-	// Header validation
-	header := lines[0]
-	if len(header) > maxHeaderLength {
-		logger.Debug().
-			Str("header", header).
-			Msg("Header exceeds maximum length")
-		return false
-	}
+func (g *Commit) SetManualMessage(message string) {
+	g.manualMessage = strings.TrimSpace(message)
+}
 
-	// Check type(scope): description format
-	typeMatch := fmt.Sprintf(`^(%s)`, strings.Join(validTypes, "|"))
-	headerPattern := fmt.Sprintf(
-		`%s(\([a-z][a-z0-9-]*\))?: [a-z][-a-z0-9 ]*[a-z0-9]$`,
-		typeMatch,
-	)
-	matched, err := regexp.MatchString(headerPattern, header)
-	if err != nil || !matched {
-		logger.Debug().
-			Str("header", header).
-			Str("pattern", headerPattern).
-			Bool("matched", matched).
-			Msg("Header format invalid")
-		return false
-	}
-
-	// More precise colon and space validation
-	parts := strings.SplitN(header, ":", 2)
-	if len(parts) != 2 {
-		logger.Debug().
-			Str("header", header).
-			Msg("Missing colon")
-		return false
-	}
-
-	description := parts[1]
-	if len(description) == 0 || description[0] != ' ' || strings.HasPrefix(description, "  ") {
-		logger.Debug().
-			Str("header", header).
-			Str("description", description).
-			Msg("Invalid spacing around colon")
-		return false
-	}
-
-	// Trim and validate description
-	description = strings.TrimSpace(description)
-	if strings.ToLower(description) != description {
-		logger.Debug().
-			Str("description", description).
-			Msg("Description contains uppercase characters")
-		return false
-	}
-
-	// Validate no period at end
-	if strings.HasSuffix(description, ".") {
-		logger.Debug().
-			Str("description", description).
-			Msg("Description ends with period")
-		return false
-	}
-
-	// Validate body format if present
-	if len(lines) > 1 {
-		// Must have blank line after header
-		if len(lines) > 2 && lines[1] != "" {
-			logger.Debug().Msg("Missing blank line after header")
-			return false
-		}
-
-		for i, line := range lines[2:] {
-			if len(line) > g.cfg.Git.PreferredLineLength {
-				logger.Warn().
-					Int("line_number", i+3).
-					Str("line", line).
-					Int("preferred_length", g.cfg.Git.PreferredLineLength).
-					Int("actual_length", len(line)).
-					Msg("Line exceeds preferred length")
-			}
-		}
-	}
-
-	logger.Debug().
-		Str("header", header).
-		Int("lines", len(lines)).
-		Msg("Valid commit message")
-
-	return true
+func (g *Commit) ClearManualMessage() {
+	g.manualMessage = ""
 }
 
 func cleanCommitMessage(message string) string {

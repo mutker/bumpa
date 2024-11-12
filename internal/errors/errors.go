@@ -30,6 +30,7 @@ const (
 	CodeTemplateError = "template_error"
 	CodeNoChanges     = "no_changes"
 	CodeLLMGenFailed  = "llm_gen_failed"
+	CodeIOError       = "io_error"
 )
 
 // Common error messages - Layer 2
@@ -42,22 +43,28 @@ var errorMessages = map[string]string{
 	CodeValidateError: "validation failed",
 	CodeGitError:      "git operation failed",
 	CodeLLMError:      "LLM operation failed",
+	CodeLLMGenFailed:  "failed to generate valid commit message",
 	CodeInputError:    "invalid input provided",
 	CodeTemplateError: "template processing failed",
 	CodeNoChanges:     "no changes staged for commit",
-	CodeLLMGenFailed:  "failed to generate valid commit message",
 	CodeVersionError:  "version operation failed",
+	CodeIOError:       "file operation failed",
 }
 
 // Base errors - Layer 3
 var (
-	ErrNotFound      = errors.New("not found")
-	ErrInvalidInput  = errors.New("invalid input")
-	ErrUnauthorized  = errors.New("unauthorized")
-	ErrInternal      = errors.New("internal error")
-	ErrLLMStatus     = errors.New("LLM status error")
-	ErrInvalidConfig = errors.New("invalid configuration")
-	ErrTimeout       = errors.New("timeout")
+	ErrNotFound          = errors.New("not found")
+	ErrInvalidInput      = errors.New("invalid input")
+	ErrUnauthorized      = errors.New("unauthorized")
+	ErrInternal          = errors.New("internal error")
+	ErrLLMStatus         = errors.New("LLM status error")
+	ErrNilContext        = errors.New("context cannot be nil")
+	ErrNilFunction       = errors.New("function definition cannot be nil")
+	ErrInvalidConfig     = errors.New("invalid configuration")
+	ErrTimeout           = errors.New("timeout")
+	ErrIO                = errors.New("I/O error")
+	ErrRateLimitExceeded = errors.New("rate limit exceeded")
+	ErrInvalidResponse   = errors.New("invalid response")
 )
 
 // Error contexts - Layer 4
@@ -113,11 +120,12 @@ const (
 	ContextCommandFailed  = "command execution failed"
 
 	// File operation contexts
-	ContextFileCreate = "failed to create file: %s"
-	ContextFileRead   = "failed to read file: %s"
-	ContextFileWrite  = "failed to write file: %s"
-	ContextFileDelete = "failed to delete file: %s"
-	ContextDirCreate  = "failed to create directory: %s"
+	ContextFileCreate  = "failed to create file: %s"
+	ContextFileRead    = "failed to read file: %s"
+	ContextFileWrite   = "failed to write file: %s"
+	ContextFileDelete  = "failed to delete file: %s"
+	ContextFileRestore = "failed to restore file: %s"
+	ContextDirCreate   = "failed to create directory: %s"
 
 	// Version bump contexts
 	ContextVersionAnalyze    = "failed to analyze version changes"

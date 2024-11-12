@@ -65,7 +65,6 @@ func (r *Repository) Head() (*plumbing.Reference, error) {
 	return head, nil
 }
 
-//nolint:ireturn // Interface return needed for go-git compatibility
 func (r *Repository) References() (storer.ReferenceIter, error) {
 	refs, err := r.repo.References()
 	if err != nil {
@@ -73,6 +72,15 @@ func (r *Repository) References() (storer.ReferenceIter, error) {
 			errors.CodeGitError,
 			err,
 			"failed to get repository references",
+		)
+	}
+	if err := refs.ForEach(func(*plumbing.Reference) error {
+		return nil
+	}); err != nil {
+		return nil, errors.WrapWithContext(
+			errors.CodeGitError,
+			err,
+			"failed to validate references",
 		)
 	}
 	return refs, nil
@@ -120,7 +128,7 @@ func (r *Repository) GetCurrentBranch() (string, error) {
 			commit, err := r.CommitObject(ref.Hash())
 			if err != nil {
 				logger.Warn().Err(err).Str("ref", ref.Name().String()).Msg("Failed to get commit object for reference")
-				return nil
+				return err // Return the error instead of nil
 			}
 			if closestCommit == nil || commit.Committer.When.After(closestCommit.Committer.When) {
 				closestBranch = ref.Name().Short()
@@ -144,7 +152,6 @@ func (r *Repository) GetCurrentBranch() (string, error) {
 	return closestBranch, nil
 }
 
-//nolint:cyclop // Complex but necessary function handling multiple git operations
 func (r *Repository) GetFileDiff(path string) (string, error) {
 	logger.Debug().
 		Str("path", path).
@@ -187,16 +194,6 @@ func (r *Repository) GetFileDiff(path string) (string, error) {
 		Str("status", string(fileStatus.Staging)).
 		Msg("File status")
 
-	// Handle special statuses
-	switch fileStatus.Staging {
-	case Untracked:
-		return newFileMessage, nil
-	case Deleted:
-		return deletedFileMessage, nil
-	case Renamed:
-		return fmt.Sprintf("[Renamed from %s]", fileStatus.Extra), nil
-	}
-
 	// Get old content from HEAD
 	head, err := r.Head()
 	if err != nil {
@@ -216,14 +213,19 @@ func (r *Repository) GetFileDiff(path string) (string, error) {
 		)
 	}
 
+	// Default to empty string for new files
+	oldContent := ""
 	file, err := commit.File(path)
-	if err != nil {
-		if errors.Is(err, object.ErrFileNotFound) {
-			logger.Debug().
-				Str("path", path).
-				Msg("File not found in HEAD")
-			return newFileMessage, nil
+	if err == nil {
+		oldContent, err = file.Contents()
+		if err != nil {
+			return "", errors.WrapWithContext(
+				errors.CodeGitError,
+				err,
+				errors.ContextGitDiff,
+			)
 		}
+	} else if !errors.Is(err, object.ErrFileNotFound) {
 		return "", errors.WrapWithContext(
 			errors.CodeGitError,
 			err,
@@ -231,47 +233,24 @@ func (r *Repository) GetFileDiff(path string) (string, error) {
 		)
 	}
 
-	oldContent, err := file.Contents()
-	if err != nil {
+	// Handle file statuses
+	switch fileStatus.Staging {
+	case Untracked:
+		return newFileMessage, nil
+	case Deleted:
+		return deletedFileMessage, nil
+	case Renamed:
+		return fmt.Sprintf("[Renamed from %s]", fileStatus.Extra), nil
+	case Modified, Added, Copied, UpdatedButUnmerged, Unmodified:
+		// Handle all other cases with normal diff
+		return r.generateDiff(oldContent, fileStatus, path)
+	default:
 		return "", errors.WrapWithContext(
 			errors.CodeGitError,
-			err,
-			errors.ContextGitDiff,
+			errors.ErrInvalidInput,
+			"unknown file status",
 		)
 	}
-
-	// For deleted files, only show old content
-	if fileStatus.Staging == Deleted {
-		diff := r.generateDiff(oldContent, "")
-		if len(strings.Split(diff, "\n")) > r.cfg.MaxDiffLines {
-			logger.Debug().
-				Int("max_lines", r.cfg.MaxDiffLines).
-				Msg("Truncating diff")
-			diff = strings.Join(strings.Split(diff, "\n")[:r.cfg.MaxDiffLines], "\n") + "\n..."
-		}
-		return diff, nil
-	}
-
-	// Read current content for modified files
-	currentContent, err := os.ReadFile(path)
-	if err != nil {
-		return "", errors.WrapWithContext(
-			errors.CodeGitError,
-			err,
-			errors.FormatContext(errors.ContextFileRead, path),
-		)
-	}
-
-	// Generate and truncate diff
-	diff := r.generateDiff(oldContent, string(currentContent))
-	if len(strings.Split(diff, "\n")) > r.cfg.MaxDiffLines {
-		logger.Debug().
-			Int("max_lines", r.cfg.MaxDiffLines).
-			Msg("Truncating diff")
-		diff = strings.Join(strings.Split(diff, "\n")[:r.cfg.MaxDiffLines], "\n") + "\n..."
-	}
-
-	return diff, nil
 }
 
 func (r *Repository) GetFilesToCommit() ([]string, error) {
@@ -316,18 +295,19 @@ func (r *Repository) GetFilesToCommit() ([]string, error) {
 }
 
 // getUserConfig returns the user's name and email from git config.
-//
-//nolint:nonamedreturns,cyclop // Using named returns for clarity as recommended by gocritic
-func (r *Repository) GetUserConfig() (name, email string, err error) {
+func (r *Repository) GetUserConfig() (string, string, error) {
+	var name, email string
+	var err error
+
 	// With includeIf support, we should first try to get the effective config values
 	// directly from git, letting it handle all the config resolution
 	if isGitAvailable() {
-		name, err = getConfigValue("", "user.name")
+		name, err = getConfigValue("user.name")
 		if err != nil {
 			return "", "", err
 		}
 
-		email, err = getConfigValue("", "user.email")
+		email, err = getConfigValue("user.email")
 		if err != nil {
 			return "", "", err
 		}
@@ -387,9 +367,13 @@ func (r *Repository) FindLastVersionTag() (string, error) {
 			versionStr := strings.TrimPrefix(tagName, "v")
 
 			// Try to parse as semantic version
-			version, err := semver.NewVersion(versionStr)
-			if err != nil {
-				// Skip tags that aren't valid semantic versions
+			version, parseErr := semver.NewVersion(versionStr)
+			if parseErr != nil {
+				// Log the parsing error but continue iteration
+				logger.Debug().
+					Str("tag", tagName).
+					Err(parseErr).
+					Msg("Skipping invalid semantic version tag")
 				return nil
 			}
 
@@ -573,8 +557,6 @@ func stageFiles(w *gogit.Worktree, files []string) error {
 }
 
 // MakeCommit creates a new commit with the given message and files
-//
-//nolint:cyclop // Complexity required for proper commit creation and signing
 func (r *Repository) MakeCommit(ctx context.Context, message string, filesToAdd []string) error {
 	select {
 	case <-ctx.Done():
@@ -620,7 +602,7 @@ func (r *Repository) MakeCommit(ctx context.Context, message string, filesToAdd 
 
 		// Check if commit signing is enabled and available
 		if isGitAvailable() {
-			signStr, err := getConfigValue("", "commit.gpgsign")
+			signStr, err := getConfigValue("commit.gpgsign")
 			if err != nil {
 				return errors.WrapWithContext(
 					errors.CodeGitError,
@@ -649,7 +631,7 @@ func (r *Repository) MakeCommit(ctx context.Context, message string, filesToAdd 
 }
 
 // CreateTag creates a new tag at HEAD with the given name and message
-func (r *Repository) CreateTag(ctx context.Context, name, message string) error {
+func (r *Repository) CreateTag(ctx context.Context, _, message string) error {
 	select {
 	case <-ctx.Done():
 		return errors.Wrap(errors.CodeTimeoutError, ctx.Err())
@@ -688,7 +670,7 @@ func (r *Repository) CreateTag(ctx context.Context, name, message string) error 
 
 		// Check if tag signing is enabled and available
 		if isGitAvailable() {
-			signStr, err := getConfigValue("", "tag.gpgsign")
+			signStr, err := getConfigValue("tag.gpgsign")
 			if err != nil {
 				return errors.WrapWithContext(
 					errors.CodeGitError,
@@ -769,7 +751,64 @@ func (r *Repository) Status() (gogit.Status, error) {
 	return status, nil
 }
 
-func (*Repository) generateDiff(old, current string) string {
+func (r *Repository) generateDiff(oldContent string, input interface{}, path string) (string, error) {
+	var diff string
+	var maxLines int
+
+	// Determine max lines and content based on input type
+	switch v := input.(type) {
+	case *gogit.FileStatus:
+		// If input is a file status, use repository's configured max diff lines
+		maxLines = r.cfg.MaxDiffLines
+
+		// Handle special cases based on file status
+		if v.Staging == Deleted {
+			diff = r.generateLineDiff(oldContent, "")
+		} else {
+			// Read current content for modified files
+			currentContent, err := os.ReadFile(path)
+			if err != nil {
+				return "", errors.WrapWithContext(
+					errors.CodeGitError,
+					err,
+					errors.FormatContext(errors.ContextFileRead, path),
+				)
+			}
+			diff = r.generateLineDiff(oldContent, string(currentContent))
+		}
+	case string:
+		// If input is a string, generate diff between old content and input
+		maxLines = 0 // No line limit for explicit string inputs
+		strInput, ok := input.(string)
+		if !ok {
+			return "", errors.WrapWithContext(
+				errors.CodeGitError,
+				errors.ErrInvalidInput,
+				"invalid input type for diff generation",
+			)
+		}
+		diff = r.generateLineDiff(oldContent, strInput)
+	default:
+		return "", errors.WrapWithContext(
+			errors.CodeGitError,
+			errors.ErrInvalidInput,
+			"unsupported input type for diff generation",
+		)
+	}
+
+	// Truncate diff if needed and max lines is set
+	if maxLines > 0 && len(strings.Split(diff, "\n")) > maxLines {
+		logger.Debug().
+			Int("max_lines", maxLines).
+			Msg("Truncating diff")
+		diff = strings.Join(strings.Split(diff, "\n")[:maxLines], "\n") + "\n..."
+	}
+
+	return diff, nil
+}
+
+// generateLineDiff performs the core line-by-line diff generation
+func (*Repository) generateLineDiff(old, current string) string {
 	// Split content into lines and clean each line
 	oldLines := strings.Split(old, "\n")
 	newLines := strings.Split(current, "\n")
