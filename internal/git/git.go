@@ -541,8 +541,17 @@ func (r *Repository) GetAllCommitMessages() ([]string, error) {
 	return r.GetCommitMessagesSince(head.Hash())
 }
 
-// stageFiles stages the given files in the worktree
-func stageFiles(w *gogit.Worktree, files []string) error {
+// StageFiles stages the given files in the repository
+func (r *Repository) StageFiles(files []string) error {
+	w, err := r.repo.Worktree()
+	if err != nil {
+		return errors.WrapWithContext(
+			errors.CodeGitError,
+			err,
+			errors.ContextGitWorkTree,
+		)
+	}
+
 	for _, file := range files {
 		_, err := w.Add(file)
 		if err != nil {
@@ -553,6 +562,7 @@ func stageFiles(w *gogit.Worktree, files []string) error {
 			)
 		}
 	}
+
 	return nil
 }
 
@@ -572,9 +582,16 @@ func (r *Repository) MakeCommit(ctx context.Context, message string, filesToAdd 
 			)
 		}
 
-		// Stage files
-		if err := stageFiles(w, filesToAdd); err != nil {
-			return err
+		// Stage files directly
+		for _, file := range filesToAdd {
+			_, err := w.Add(file)
+			if err != nil {
+				return errors.WrapWithContext(
+					errors.CodeGitError,
+					err,
+					"failed to stage file: "+file,
+				)
+			}
 		}
 
 		// Get user configuration

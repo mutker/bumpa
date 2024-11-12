@@ -267,6 +267,12 @@ func (b *Bumper) ApplyVersionChange(ctx context.Context) error {
 		if err := b.updateFiles(); err != nil {
 			return err
 		}
+
+		// Stage files through the repository
+		if err := b.repo.StageFiles(b.GetFilesToUpdate()); err != nil {
+			return err
+		}
+
 		if err := b.commitVersionChange(ctx); err != nil {
 			return err
 		}
@@ -302,55 +308,24 @@ func (b *Bumper) updateFiles() error {
 	return nil
 }
 
-// updateFile updates a single file with the new version
-// Creates a backup before modification and restores on failure
+// updateFile creates/updates a single file with the new version
 func (b *Bumper) updateFile(file config.VersionFile) error {
 	logger.Info().
 		Str("file", file.Path).
 		Msg("Updating version in file")
 
-	content, err := os.ReadFile(file.Path)
-	if err != nil {
+	// Determine content
+	content := b.proposed.String()
+
+	// Write content to file
+	if err := os.WriteFile(file.Path, []byte(content), filePerms); err != nil {
 		return errors.WrapWithContext(
 			errors.CodeInputError,
 			err,
-			errors.FormatContext(errors.ContextFileRead, file.Path),
+			errors.FormatContext(errors.ContextFileWrite, file.Path),
 		)
 	}
 
-	// Create backup
-	backupPath := file.Path + ".bak"
-	if err := os.WriteFile(backupPath, content, filePerms); err != nil {
-		return errors.WrapWithContext(
-			errors.CodeInputError,
-			err,
-			errors.FormatContext(errors.ContextFileWrite, backupPath),
-		)
-	}
-
-	updated := string(content)
-	for _, pattern := range file.Replace {
-		old := strings.ReplaceAll(pattern, "{version}", b.current.String())
-		replacement := strings.ReplaceAll(pattern, "{version}", b.proposed.String())
-		updated = strings.ReplaceAll(updated, old, replacement)
-	}
-
-	if updated != string(content) {
-		if err := os.WriteFile(file.Path, []byte(updated), filePerms); err != nil {
-			// Attempt to restore backup on failure
-			if renameErr := os.Rename(backupPath, file.Path); renameErr != nil {
-				return errors.WrapWithContext(
-					errors.CodeIOError,
-					errors.ErrIO,
-					errors.ContextFileRestore,
-				)
-			}
-			return err
-		}
-	}
-
-	// Remove backup
-	os.Remove(backupPath)
 	return nil
 }
 

@@ -382,7 +382,8 @@ func buildVersionPrompt(state *version.WorkflowState) string {
 	}
 
 	if state.NeedsCommit {
-		prompt.WriteString("  • Update files and create commit")
+		// Changed this line to say "Create file" instead of "Update files"
+		prompt.WriteString("  • Create file and commit")
 		if state.SignCommit {
 			prompt.WriteString(" (signed)")
 		}
