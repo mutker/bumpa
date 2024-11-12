@@ -1,4 +1,3 @@
-//nolint:ireturn // Interfaces return needed for chaining
 package logger
 
 import (
@@ -35,7 +34,10 @@ type Config struct {
 	FilePerms   os.FileMode
 }
 
-var defaultLogger zerolog.Logger
+var (
+	defaultLogger zerolog.Logger
+	isInitialized bool
+)
 
 // zerologEvent adapts zerolog.Event to our LogEvent interface
 type zerologEvent struct {
@@ -119,7 +121,6 @@ func Init(cfg Config) error {
 		}
 		output = file
 	} else {
-		// Use console writer with colors for terminal output
 		output = zerolog.ConsoleWriter{
 			Out:        os.Stdout,
 			TimeFormat: cfg.TimeFormat,
@@ -138,5 +139,11 @@ func Init(cfg Config) error {
 	zerolog.SetGlobalLevel(level)
 
 	defaultLogger = zerolog.New(output).With().Timestamp().Logger()
+	isInitialized = true
 	return nil
+}
+
+// IsInitialized returns whether the logger has been initialized
+func IsInitialized() bool {
+	return isInitialized
 }

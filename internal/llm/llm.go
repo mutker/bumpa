@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"text/template"
@@ -20,14 +21,15 @@ import (
 // Core constants
 const (
 	ProviderOpenAICompatible = "openai-compatible"
+	splitPartsExpected       = 2
 )
 
-// Core Interfaces
+// Core interfaces
 type Client interface {
-	GenerateText(ctx context.Context, systemPrompt, userPrompt string, tools []Tool) (string, error)
+	GenerateText(ctx context.Context, systemPrompt, userPrompt string, functions []APIFunction) (string, error)
 }
 
-// Primary Client Structure
+// Primary client structure
 type OpenAIClient struct {
 	url         string
 	token       string
@@ -38,14 +40,14 @@ type OpenAIClient struct {
 
 // Request/Response structures
 type ChatRequest struct {
-	Model      string    `json:"model"`
-	Messages   []Message `json:"messages"`
-	Tools      []Tool    `json:"tools,omitempty"`
-	ToolChoice string    `json:"tool_choice,omitempty"` //nolint:tagliatelle // Following OpenAI API spec
+	Model     string     `json:"model"`
+	Messages  []Message  `json:"messages"`
+	Functions []Function `json:"tools,omitempty"`
 }
 
 type ChatResponse struct {
 	Choices []MessageChoice `json:"choices"`
+	Error   *APIError       `json:"error,omitempty"`
 }
 
 type Message struct {
@@ -54,29 +56,28 @@ type Message struct {
 }
 
 type MessageResponse struct {
-	Content   string     `json:"content"`
-	ToolCalls []ToolCall `json:"tool_calls,omitempty"` //nolint:tagliatelle // Matching API spec
+	Content       string         `json:"content"`
+	FunctionCalls []FunctionCall `json:"tool_calls,omitempty"` //nolint:tagliatelle // Following OpenAI API spec
 }
 
 type MessageChoice struct {
 	Message MessageResponse `json:"message"`
 	Index   int             `json:"index"`
+	Role    string          `json:"role,omitempty"`
+	Content string          `json:"content,omitempty"`
 }
 
-// Tool-related structures
-type Tool struct {
-	Type     string   `json:"type"`
-	Function Function `json:"function"`
-	//nolint:tagliatelle // Maintaining API spec naming
-	SystemPrompt string `mapstructure:"system_prompt" yaml:"system_prompt"`
-	//nolint:tagliatelle // Maintaining API spec naming
-	UserPrompt string `mapstructure:"user_prompt" yaml:"user_prompt"`
-}
-
-type Function struct {
+// API-related structures
+type APIFunction struct {
 	Name        string     `json:"name"`
 	Description string     `json:"description"`
 	Parameters  Parameters `json:"parameters"`
+}
+
+type APIError struct {
+	Message string `json:"message"`
+	Type    string `json:"type"`
+	Code    int    `json:"code,omitempty"`
 }
 
 type Parameters struct {
@@ -86,19 +87,37 @@ type Parameters struct {
 }
 
 type Property struct {
-	Type        string   `json:"type"           yaml:"type"`
-	Description string   `json:"description"    yaml:"description"`
-	Enum        []string `json:"enum,omitempty" yaml:"enum,omitempty"`
+	Type        string   `json:"type"`
+	Description string   `json:"description"`
+	Enum        []string `json:"enum,omitempty"`
 }
 
-type ToolCall struct {
+type Function struct {
+	Type     string      `json:"type"`
+	Function FunctionDef `json:"function"`
+}
+
+type FunctionDef struct {
+	Name        string     `json:"name"`
+	Description string     `json:"description"`
+	Parameters  Parameters `json:"parameters"`
+}
+
+type FunctionCall struct {
 	Function struct {
 		Name      string `json:"name"`
 		Arguments string `json:"arguments"`
 	} `json:"function"`
 }
 
-type ToolCallArguments struct {
+type FunctionChoice struct {
+	Type     string `json:"type,omitempty"`
+	Function *struct {
+		Name string `json:"name,omitempty"`
+	} `json:"function,omitempty"`
+}
+
+type FunctionCallArguments struct {
 	File                  string `json:"file"`
 	Status                string `json:"status"`
 	Diff                  string `json:"diff"`
@@ -106,7 +125,6 @@ type ToolCallArguments struct {
 	Summary               string `json:"summary"`
 }
 
-//nolint:ireturn,nolintlint // Interface return needed for provider flexibility and testing
 func New(cfg *config.LLMConfig) (Client, error) {
 	logger.Debug().
 		Str("provider", cfg.Provider).
@@ -135,7 +153,15 @@ func New(cfg *config.LLMConfig) (Client, error) {
 	}, nil
 }
 
-func (c *OpenAIClient) GenerateText(ctx context.Context, systemPrompt, userPrompt string, tools []Tool) (string, error) {
+func (c *OpenAIClient) GenerateText(ctx context.Context, systemPrompt, userPrompt string, apiFunctions []APIFunction) (string, error) {
+	if ctx == nil {
+		return "", errors.WrapWithContext(
+			errors.CodeConfigError,
+			errors.ErrInvalidInput,
+			"context cannot be nil",
+		)
+	}
+
 	select {
 	case <-ctx.Done():
 		return "", errors.WrapWithContext(
@@ -149,20 +175,27 @@ func (c *OpenAIClient) GenerateText(ctx context.Context, systemPrompt, userPromp
 			{Role: "user", Content: userPrompt},
 		}
 
+		functions := make([]Function, len(apiFunctions))
+		for i, fn := range apiFunctions {
+			functions[i] = Function{
+				Type:     "function",
+				Function: apiFunctionToFunctionDef(&fn),
+			}
+		}
+
 		request := ChatRequest{
-			Model:      c.model,
-			Messages:   messages,
-			Tools:      tools,
-			ToolChoice: "auto",
+			Model:     c.model,
+			Messages:  messages,
+			Functions: functions,
 		}
 
 		logger.Debug().
 			Int("message_count", len(messages)).
-			Int("tool_count", len(tools)).
+			Int("function_count", len(functions)).
 			Str("model", c.model).
 			Msg("Preparing LLM request")
 
-		requestJSON, err := json.Marshal(&request) //nolint:musttag // ChatRequest is properly tagged with json
+		requestJSON, err := json.Marshal(&request)
 		if err != nil {
 			return "", errors.WrapWithContext(
 				errors.CodeLLMError,
@@ -268,11 +301,11 @@ func (c *OpenAIClient) makeRequest(ctx context.Context, requestJSON []byte) (*Ch
 	}
 }
 
-// Tool-related functions
-func CallTool(ctx context.Context, client Client, tool *config.Tool, input interface{}) (string, error) {
+// Function-related functions
+func CallFunction(ctx context.Context, client Client, fn *config.LLMFunction, input map[string]interface{}) (string, error) {
 	startTime := time.Now()
 
-	// Get the actual model being used
+	// Get the model being used
 	var model string
 	if openAIClient, ok := client.(*OpenAIClient); ok {
 		model = openAIClient.model
@@ -281,27 +314,40 @@ func CallTool(ctx context.Context, client Client, tool *config.Tool, input inter
 	logEvent := logger.Info().
 		Str("model", model)
 
-	if inputMap, ok := input.(map[string]interface{}); ok {
-		if file, exists := inputMap["file"]; exists {
-			if filename, ok := file.(string); ok {
-				logEvent = logEvent.Str("file", filename)
-			}
+	if file, exists := input["file"]; exists {
+		if filename, ok := file.(string); ok {
+			logEvent = logEvent.Str("file", filename)
 		}
 	}
-	logEvent.Msg("Calling LLM tool: " + tool.Name)
+	logEvent.Msg("Calling LLM function: " + fn.Name)
 
-	if err := validateToolConfig(tool); err != nil {
+	if err := validateFunctionConfig(fn); err != nil {
 		return "", err
 	}
 
-	properties := convertProperties(tool.Function.Parameters.Properties)
-	toolDef := createToolDefinition(tool, properties)
+	functionDef := createFunctionDefinition(fn)
 
-	if err := validateTool(&toolDef); err != nil {
+	if err := validateFunction(&functionDef); err != nil {
 		return "", err
 	}
 
-	userPrompt, err := executeTemplate("user_prompt", tool.UserPrompt, input)
+	// Debug log the input data
+	logger.Debug().
+		Str("function", fn.Name).
+		Interface("template_vars", input).
+		Msg("Template variables available")
+
+	// Execute templates for both prompts
+	systemPrompt, err := executeTemplate("system_prompt", fn.SystemPrompt, input)
+	if err != nil {
+		return "", errors.WrapWithContext(
+			errors.CodeTemplateError,
+			err,
+			"failed to execute system prompt template",
+		)
+	}
+
+	userPrompt, err := executeTemplate("user_prompt", fn.UserPrompt, input)
 	if err != nil {
 		return "", errors.WrapWithContext(
 			errors.CodeTemplateError,
@@ -310,16 +356,23 @@ func CallTool(ctx context.Context, client Client, tool *config.Tool, input inter
 		)
 	}
 
-	response, err := client.GenerateText(ctx, tool.SystemPrompt, userPrompt, []Tool{toolDef})
+	// Debug log the processed prompts
+	logger.Debug().
+		Str("function", fn.Name).
+		Str("processed_system_prompt", systemPrompt).
+		Str("processed_user_prompt", userPrompt).
+		Msg("Processed prompts")
+
+	response, err := client.GenerateText(ctx, systemPrompt, userPrompt, []APIFunction{functionDef})
 	if err != nil {
 		logger.Warn().
 			Err(err).
-			Str("tool", tool.Name).
+			Str("function", fn.Name).
 			Msg("LLM call failed")
 		return "", err
 	}
 
-	response = processToolResponse(response, tool.Name)
+	response = processFunctionResponse(response, fn.Name)
 	if response == "" {
 		return "", errors.WrapWithContext(
 			errors.CodeLLMError,
@@ -329,36 +382,65 @@ func CallTool(ctx context.Context, client Client, tool *config.Tool, input inter
 	}
 
 	logger.Debug().
-		Str("tool", tool.Name).
+		Str("function", fn.Name).
 		Int("response_length", len(response)).
 		Dur("duration", time.Since(startTime)).
-		Msg("LLM tool execution completed")
+		Msg("LLM function execution completed")
 
 	return response, nil
 }
 
-func processToolResponse(response, toolName string) string {
+func createFunctionDefinition(fn *config.LLMFunction) APIFunction {
+	return APIFunction{
+		Name:        fn.Name,
+		Description: fn.Description,
+		Parameters: Parameters{
+			Type:       fn.Parameters.Type,
+			Properties: convertProperties(fn.Parameters.Properties),
+			Required:   fn.Parameters.Required,
+		},
+	}
+}
+
+// APIFunction to FunctionDef conversion
+func apiFunctionToFunctionDef(fn *APIFunction) FunctionDef {
+	if fn == nil {
+		return FunctionDef{}
+	}
+	return FunctionDef(*fn)
+}
+
+func processFunctionResponse(response, functionName string) string {
 	if strings.HasPrefix(response, "{") && strings.HasSuffix(response, "}") {
-		var toolResponse struct {
+		var functionResponse struct {
 			Summary string `json:"summary"`
 			Message string `json:"message"`
 			Content string `json:"content"`
+			File    string `json:"file"`
+			Status  string `json:"status"`
+			Diff    string `json:"diff"`
 		}
 
-		if err := json.Unmarshal([]byte(response), &toolResponse); err == nil {
-			if toolResponse.Summary != "" {
-				return toolResponse.Summary
+		if err := json.Unmarshal([]byte(response), &functionResponse); err == nil {
+			// Check fields in priority order
+			if functionResponse.Summary != "" {
+				return functionResponse.Summary
 			}
-			if toolResponse.Message != "" {
-				return toolResponse.Message
+			if functionResponse.Message != "" {
+				return functionResponse.Message
 			}
-			if toolResponse.Content != "" {
-				return toolResponse.Content
+			if functionResponse.Content != "" {
+				return functionResponse.Content
+			}
+
+			// If we have file info but no summary, construct a basic one
+			if functionResponse.File != "" {
+				return "update %s" + filepath.Base(functionResponse.File)
 			}
 		}
 
 		logger.Debug().
-			Str("tool_name", toolName).
+			Str("function_name", functionName).
 			Str("response", response).
 			Msg("Received JSON response but couldn't extract expected fields")
 	}
@@ -366,19 +448,40 @@ func processToolResponse(response, toolName string) string {
 	return cleanResponse(response)
 }
 
-func createToolDefinition(tool *config.Tool, properties map[string]Property) Tool {
-	return Tool{
-		Type: "function",
-		Function: Function{
-			Name:        tool.Function.Name,
-			Description: tool.Function.Description,
-			Parameters: Parameters{
-				Type:       tool.Function.Parameters.Type,
-				Properties: properties,
-				Required:   tool.Function.Parameters.Required,
-			},
-		},
+func validateFunction(fn *APIFunction) error {
+	if fn == nil {
+		return errors.WrapWithContext(
+			errors.CodeConfigError,
+			errors.ErrInvalidInput,
+			"function definition is required",
+		)
 	}
+
+	if fn.Name == "" {
+		return errors.WrapWithContext(
+			errors.CodeConfigError,
+			errors.ErrInvalidInput,
+			"function name is required",
+		)
+	}
+
+	if fn.Parameters.Type == "" {
+		return errors.WrapWithContext(
+			errors.CodeConfigError,
+			errors.ErrInvalidInput,
+			"parameters type is required",
+		)
+	}
+
+	if len(fn.Parameters.Properties) == 0 {
+		return errors.WrapWithContext(
+			errors.CodeConfigError,
+			errors.ErrInvalidInput,
+			"parameters properties are required",
+		)
+	}
+
+	return nil
 }
 
 // Validation functions
@@ -414,44 +517,16 @@ func validateConfig(cfg *config.LLMConfig) error {
 	return nil
 }
 
-func validateTool(tool *Tool) error {
-	if tool.Type != "function" {
-		return errors.New(errors.CodeConfigError)
-	}
-	if tool.Function.Name == "" {
+func validateFunctionConfig(fn *config.LLMFunction) error {
+	if fn == nil {
 		return errors.WrapWithContext(
 			errors.CodeConfigError,
 			errors.ErrInvalidInput,
-			"missing function name",
-		)
-	}
-	if tool.Function.Parameters.Type == "" {
-		return errors.WrapWithContext(
-			errors.CodeConfigError,
-			errors.ErrInvalidInput,
-			"missing parameters type",
-		)
-	}
-	if len(tool.Function.Parameters.Properties) == 0 {
-		return errors.WrapWithContext(
-			errors.CodeConfigError,
-			errors.ErrInvalidInput,
-			"missing parameters properties",
-		)
-	}
-	return nil
-}
-
-func validateToolConfig(tool *config.Tool) error {
-	if tool == nil {
-		return errors.WrapWithContext(
-			errors.CodeConfigError,
-			errors.ErrInvalidInput,
-			"tool configuration is required",
+			"function configuration is required",
 		)
 	}
 
-	if strings.TrimSpace(tool.SystemPrompt) == "" {
+	if strings.TrimSpace(fn.SystemPrompt) == "" {
 		return errors.WrapWithContext(
 			errors.CodeConfigError,
 			errors.ErrInvalidInput,
@@ -459,7 +534,7 @@ func validateToolConfig(tool *config.Tool) error {
 		)
 	}
 
-	if strings.TrimSpace(tool.UserPrompt) == "" {
+	if strings.TrimSpace(fn.UserPrompt) == "" {
 		return errors.WrapWithContext(
 			errors.CodeConfigError,
 			errors.ErrInvalidInput,
@@ -467,7 +542,7 @@ func validateToolConfig(tool *config.Tool) error {
 		)
 	}
 
-	if tool.Function.Name == "" {
+	if fn.Name == "" {
 		return errors.WrapWithContext(
 			errors.CodeConfigError,
 			errors.ErrInvalidInput,
@@ -475,7 +550,7 @@ func validateToolConfig(tool *config.Tool) error {
 		)
 	}
 
-	if tool.Function.Parameters.Type == "" {
+	if fn.Parameters.Type == "" {
 		return errors.WrapWithContext(
 			errors.CodeConfigError,
 			errors.ErrInvalidInput,
@@ -483,7 +558,7 @@ func validateToolConfig(tool *config.Tool) error {
 		)
 	}
 
-	if len(tool.Function.Parameters.Properties) == 0 {
+	if len(fn.Parameters.Properties) == 0 {
 		return errors.WrapWithContext(
 			errors.CodeConfigError,
 			errors.ErrInvalidInput,
@@ -496,7 +571,7 @@ func validateToolConfig(tool *config.Tool) error {
 
 // Helper functions
 func convertProperties(configProps map[string]config.Property) map[string]Property {
-	properties := make(map[string]Property)
+	properties := make(map[string]Property, len(configProps))
 	for k, v := range configProps {
 		properties[k] = Property{
 			Type:        v.Type,
@@ -542,6 +617,14 @@ func extractContent(resp *ChatResponse) (string, error) {
 		)
 	}
 
+	if resp.Error != nil {
+		return "", errors.WrapWithContext(
+			errors.CodeLLMError,
+			errors.ErrLLMStatus,
+			resp.Error.Message,
+		)
+	}
+
 	if len(resp.Choices) == 0 {
 		return "", errors.WrapWithContext(
 			errors.CodeLLMError,
@@ -554,15 +637,13 @@ func extractContent(resp *ChatResponse) (string, error) {
 
 	logger.Debug().
 		Int("choice_index", choice.Index).
-		Int("tool_calls_count", len(choice.Message.ToolCalls)).
+		Bool("has_function_calls", len(choice.Message.FunctionCalls) > 0).
 		Bool("has_content", choice.Message.Content != "").
 		Msg("Processing LLM response")
 
-	if len(choice.Message.ToolCalls) > 0 {
-		toolCall := choice.Message.ToolCalls[0]
-		if toolCall.Function.Arguments != "" {
-			return toolCall.Function.Arguments, nil
-		}
+	// Check for function calls
+	if len(choice.Message.FunctionCalls) > 0 {
+		return choice.Message.FunctionCalls[0].Function.Arguments, nil
 	}
 
 	if choice.Message.Content != "" {
@@ -654,7 +735,14 @@ func parseRateLimitHeaders(headers http.Header) (RateLimitInfo, error) {
 }
 
 func executeTemplate(name, text string, data interface{}) (string, error) {
-	tmpl, err := template.New(name).Parse(text)
+	// Add debug logging for template execution
+	logger.Debug().
+		Str("template_name", name).
+		Str("template_text", text).
+		Interface("template_data", data).
+		Msg("Executing template")
+
+	tmpl, err := template.New(name).Option("missingkey=error").Parse(text)
 	if err != nil {
 		return "", errors.WrapWithContext(
 			errors.CodeTemplateError,
@@ -668,9 +756,15 @@ func executeTemplate(name, text string, data interface{}) (string, error) {
 		return "", errors.WrapWithContext(
 			errors.CodeTemplateError,
 			err,
-			"failed to execute template",
+			fmt.Sprintf("failed to execute template: %v (data: %+v)", err, data),
 		)
 	}
 
-	return buf.String(), nil
+	result := buf.String()
+	logger.Debug().
+		Str("template_name", name).
+		Str("result", result).
+		Msg("Template execution result")
+
+	return result, nil
 }

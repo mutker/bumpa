@@ -12,12 +12,12 @@ bumpa leverages LLMs to assist in generating changelogs, bumping application ver
 - Generate commit messages adhering to conventional commits format (with support for GPG commit signing)
 - Flexible LLM integration: Use locally via Ollama or any OpenAI API-compatible vendor
 - Advanced git configuration handling (with includeIf directives support)
+- Bump application versions following semantic versioning principles
 
 ## Planned features
 
 - Create pull request descriptions
 - Generate changelogs automatically
-- Bump application versions following semantic versioning principles
 - Create release notes (configurable for different version bump types)
 - Multiple usage modes: Standalone CLI, Git commit hook, or in CI/CD workflows
 - Templating support for prompts, changelogs, release notes, commit messages, and pull request descriptions
